@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1.45.1", features = ["full"] }
 zeromq = "0.4.1"
+epicars = { path = "./epicars" }
