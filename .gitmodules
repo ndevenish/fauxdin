@@ -1,3 +1,6 @@
 [submodule "epicars"]
 	path = epicars
 	url = https://github.com/ndevenish/epicars.git
+[submodule "gw-eiger"]
+	path = gw-eiger
+	url = git@github.com:graeme-winter/eiger.git
