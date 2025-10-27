@@ -118,12 +118,12 @@ def make_send_data(socket, nxs):
     t0 = time.time()
     dt = 0
     FRAME = 0
-    for depth, (ny, nx), size, chunk in tqdm(chunk_generator(nxs)):
+    for depth, (ny, nx), size, chunk in tqdm(chunk_generator(nxs), total=3600):
         start, stop, real, md5 = (
-            meta_info["start_time"][FRAME],
-            meta_info["stop_time"][FRAME],
-            meta_info["real_time"][FRAME],
-            meta_info["hash"][FRAME],
+            meta_info["start_time"][0],
+            meta_info["stop_time"][0],
+            meta_info["real_time"][0],
+            meta_info["hash"][0],
         )
 
         if dt == 0:
@@ -179,7 +179,6 @@ def main():
     socket = context.socket(zmq.PUSH)
     # socket.setsockopt(zmq.HEARTBEAT_IVL, 1000)
     socket.bind("tcp://127.0.0.1:9999")
-    socket.send(b"somthing")
     make_send_header(socket, meta)
     make_send_data(socket, nxs)
     make_send_end(socket)

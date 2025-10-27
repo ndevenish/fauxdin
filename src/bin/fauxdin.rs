@@ -1,8 +1,10 @@
-use std::time::Duration;
+use std::{thread::JoinHandle, time::Duration};
 
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
 use fauxdin::zmq::PullSocket;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 // use rzmq::{Msg, ZmqError};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -16,10 +18,10 @@ use tracing_subscriber::EnvFilter;
 //     }
 // }
 
-async fn maybe_recv(t: &mut Option<PullSocket>) -> Option<Option<zmq::Message>> {
+async fn maybe_recv_multipart(t: &mut Option<PullSocket>) -> Option<Option<Vec<zmq::Message>>> {
     match t {
-        Some(socket) => Some(socket.recv().await),
-        None => todo!(),
+        Some(socket) => Some(socket.recv_multipart().await),
+        None => None,
     }
 }
 /// Wrap an [`rzmq::Socket`] in a cancel-safe way
@@ -55,6 +57,33 @@ async fn maybe_recv(t: &mut Option<PullSocket>) -> Option<Option<zmq::Message>> 
 //     }
 // }
 
+// struct ZMQPump {
+//     sock_in: Option<PullSocket>,
+//     sock_out: PushSocket,
+// }
+
+// impl ZMQPump {
+//     fn new(initial_target_endpoint: &str, push_endpoint: &str) -> Self {}
+// }
+
+fn do_pump(target_endpoint: Watcher<String>, push_endpoint: &str, stop: CancellationToken) {
+    while !stop.cancelled() {}
+}
+struct PumpHandle {
+    handle: JoinHandle<()>,
+    stop: CancellationToken,
+    messages: mpsc::UnboundedReceiver<zmq::Message>,
+}
+
+impl PumpHandle {
+    fn new() -> Self {}
+    pub fn stop(&mut self) {
+        self.stop.cancel();
+    }
+    pub async fn recv(&mut self) -> Option<zmq::Message> {
+        self.messages.recv().await
+    }
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -75,14 +104,7 @@ async fn main() -> Result<()> {
         .build()
         .unwrap()
         .watch();
-
-    // let ctx_in = rzmq::Context::new().unwrap();
-    // let ctx_out = rzmq::Context::new().unwrap();
-
-    // Create the pipe out, for others to connect to
-    // let push_endpoint = "tcp://0.0.0.0:9999";
-    // info!("Creating output PUSH socket {push_endpoint}");
-    // let sock_out = ctx_out.socket(rzmq::SocketType::Push)?;
+    let mut enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
 
     let current_target = target.borrow_and_update().unwrap();
     let mut sock_in = Some(PullSocket::connect(&current_target)?);
@@ -90,44 +112,32 @@ async fn main() -> Result<()> {
 
     let _server = ServerBuilder::new(library).start().await.unwrap();
 
-    let ct = zmq::Context::new();
-    let mon = ct.socket(zmq::PAIR)?;
-    mon.connect("inproc://monitor")?;
     loop {
-        let event_msg = match mon.recv_msg(zmq::DONTWAIT) {
-            Ok(msg) => msg,
-            Err(zmq::Error::EAGAIN) => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+        tokio::select! {
+            Ok(_) = target.changed() => {
+                // The user changed the connection endpoint via our PV server.. connect to the new one
+                let endpoint = target.borrow_and_update().unwrap();
+                if let Some(sock_to_close) = sock_in.take() {
+                    sock_to_close.close();
+                }
+                if endpoint.is_empty() {
+                    info!("Connection endpoint cleared, suspending connection");
+                } else {
+                    info!("Connection target changed to {endpoint}, making new connection");
+                    sock_in = Some(PullSocket::connect(&endpoint)?);
+                }
+            },
+            Ok(_) = enabled.changed() => {
+                if enabled.borrow_and_update().unwrap {
+
+                } else {
+
+                }
+            },
+            Some(Some(messages)) = maybe_recv_multipart(&mut sock_in) => {
+                // let sizes =;
+                println!("Received: {} messages, size: {}", messages.len(),  messages.iter().map(|m| m.len().to_string()).collect::<Vec<_>>().join(", "));
             }
-            Err(e) => Err(e)?,
-        };
-        println!("Message: {event_msg:?}");
+        }
     }
-    // println!("{:?}", &sock_in.as_mut().unwrap().recv().await);
-
-    // let ctx = zmq::Context::new();
-
-    // loop {
-    //     tokio::select! {
-    //         Ok(_) = target.changed() => {
-    //             // The user changed the connection endpoint via our PV server
-    //             let endpoint = target.borrow_and_update().unwrap();
-    //             if let Some(sock_to_close) = sock_in.take() {
-    //                 sock_to_close.close();
-    //             }
-    //             if endpoint.is_empty() {
-    //                 info!("Connection endpoint cleared, suspending connection");
-    //                 continue;
-    //             }
-
-    //             info!("Connection target changed to {endpoint}, making new connection");
-    //             sock_in = Some(PullSocket::connect(&endpoint)?);
-    //             continue;
-    //         },
-    //         Some(message) = maybe_recv(&mut sock_in) => {
-    //             println!("Received: {message:?}");
-    //         }
-    //     }
-    // }
 }

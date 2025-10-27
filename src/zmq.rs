@@ -1,69 +1,89 @@
-use std::{cell::RefCell, sync::Arc, thread};
+use std::{cell::RefCell, panic, sync::Arc, thread};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-// struct Context {
-//     context: zmq::Context,
-// }
-// impl Context {
-//     pub fn new() -> Self {
-//         Self {
-//             context: zmq::Context::new(),
-//         }
-//     }
-//     pub fn push(&self) -> Result<Socket> {
-//         Ok(Socket {
-//             socket: Some(self.context.socket(zmq::PUSH)?),
-//             recv_task: Default::default(),
-//             cancel: CancellationToken::new(),
-//         })
-//     }
-//     pub fn pull(&self) -> Result<Socket> {
-//         Ok(Socket {
-//             socket: Some(self.context.socket(zmq::PULL)?),
-//             recv_task: Default::default(),
-//             cancel: CancellationToken::new(),
-//         })
-//     }
-// }
-
-// struct InnerSocket {
-
-// }
-
 pub struct PullSocket {
     recv_task: Option<thread::JoinHandle<()>>,
+    /// Token cancelled when the recv loop has finished
+    fin_token: CancellationToken,
     cancel: CancellationToken,
     recv: mpsc::UnboundedReceiver<zmq::Message>,
+    multipart_pending: Vec<zmq::Message>,
 }
 
 impl PullSocket {
     pub fn connect(endpoint: &str) -> Result<Self> {
-        let context = zmq::Context::new();
-        let socket = context.socket(zmq::PULL)?;
-        socket.monitor("inproc://monitor", zmq::SocketEvent::ALL as i32)?;
-        socket.connect(endpoint)?;
-        socket.set_rcvtimeo(100)?;
         let token = CancellationToken::new();
         let inner_token = token.clone();
         let (tx, rx) = mpsc::unbounded_channel();
+        // let (closed_tx, closed_rx) = oneshot::channel();
+        let fin_token = CancellationToken::new();
+        let inner_fin_token = fin_token.clone();
+        let inner_endpoint = endpoint.to_string();
         Ok(PullSocket {
-            recv_task: Some(thread::spawn(|| {
-                inner_recv(socket, inner_token, tx);
+            recv_task: Some(thread::spawn(move || {
+                let result = panic::catch_unwind(move || {
+                    // Spin these up on the same thread, as Socket should be !Send
+                    let context = zmq::Context::new();
+                    let socket = context.socket(zmq::PULL).unwrap();
+                    socket.connect(&inner_endpoint).unwrap();
+                    socket.set_rcvtimeo(100).unwrap();
+                    inner_recv(socket, inner_token, tx);
+                });
+                inner_fin_token.cancel();
+                if let Err(payload) = result {
+                    panic::resume_unwind(payload);
+                }
             })),
+            fin_token,
             cancel: token,
             recv: rx,
+            multipart_pending: Vec::new(),
         })
     }
     pub async fn recv(&mut self) -> Option<zmq::Message> {
-        self.recv.recv().await
+        if !self.multipart_pending.is_empty() {
+            // We were asked for a single message before the multipart ended... return it
+            Some(self.multipart_pending.remove(0))
+        } else {
+            self.recv.recv().await
+        }
     }
+    pub async fn recv_multipart(&mut self) -> Option<Vec<zmq::Message>> {
+        loop {
+            match self.recv.recv().await {
+                Some(msg) => {
+                    let is_more = msg.get_more();
+                    self.multipart_pending.push(msg);
+                    // Keep looping here until we have all the messages
+                    if is_more {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                None => {
+                    if self.multipart_pending.is_empty() {
+                        return None;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Some(std::mem::take(&mut self.multipart_pending))
+    }
+
     pub fn close(mut self) {
         self.cancel.cancel();
         self.recv_task.take().map(|v| v.join());
+    }
+    /// Wait (Cancel-safe) for the socket to be closed.
+    pub async fn closed(&self) {
+        self.fin_token.cancelled().await;
     }
 }
 
@@ -83,14 +103,12 @@ fn inner_recv(
         let mut msg = zmq::Message::new();
         match socket.recv(&mut msg, 0) {
             Ok(_) => {
-                println!("Sending {msg:?}");
                 if sender.send(msg).is_err() {
                     println!("Error: Failed to send");
                     break;
                 }
             }
             Err(zmq::Error::EAGAIN) => {
-                println!("EAGAIN");
                 continue;
             }
             Err(e) => {
