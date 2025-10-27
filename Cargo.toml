@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.45.1", features = ["full"] }
+tokio = { version = "1.45.1", features = ["full", "sync"] }
 epicars = { path = "./epicars" }
 anyhow = "1.0.100"
 clap = { version = "4.5.50", features = ["derive"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing = "0.1.41"
-rzmq = "0.5.4"
+#rzmq = "0.5.4"
 serde = { version = "1.0.228", features = ["derive"] }
+zmq = "0.10.0"
+tokio-util = "0.7.16"
