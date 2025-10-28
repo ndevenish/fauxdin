@@ -3,12 +3,9 @@ use std::thread::JoinHandle;
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
 use fauxdin::zmq::PullSocket;
-use tokio::{
-    runtime::{self, Runtime},
-    sync::mpsc,
-};
+use tokio::{runtime, sync::mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
 /// Asynchronously call recv, if the argument is Some()
@@ -18,13 +15,13 @@ async fn maybe_recv(t: &mut Option<PullSocket>) -> Option<Option<zmq::Message>> 
         None => None,
     }
 }
-/// Asynchronously call recv_multipart, if the argument is Some()
-async fn maybe_recv_multipart(t: &mut Option<PullSocket>) -> Option<Option<Vec<zmq::Message>>> {
-    match t {
-        Some(socket) => Some(socket.recv_multipart().await),
-        None => None,
-    }
-}
+// /// Asynchronously call recv_multipart, if the argument is Some()
+// async fn maybe_recv_multipart(t: &mut Option<PullSocket>) -> Option<Option<Vec<zmq::Message>>> {
+//     match t {
+//         Some(socket) => Some(socket.recv_multipart().await),
+//         None => None,
+//     }
+// }
 
 /// Basic wrapper of message data (as [`zmq::Message`] is not Clone)
 struct Message {
@@ -42,6 +39,7 @@ impl From<&zmq::Message> for Message {
 
 /// Handle movement of messages between input and output ZMQ streams
 async fn do_pump(
+    mut enabled: Watcher<bool>,
     mut target_endpoint: Watcher<String>,
     push_endpoint: &str,
     stop: CancellationToken,
@@ -49,9 +47,11 @@ async fn do_pump(
 ) -> Result<()> {
     // Make the sockets
     let mut sock_in = None;
-    let endpoint = target_endpoint.borrow_and_update()?;
-    if !endpoint.is_empty() {
-        sock_in = Some(PullSocket::connect(&endpoint)?);
+    {
+        let endpoint = target_endpoint.borrow_and_update()?;
+        if !endpoint.is_empty() && enabled.borrow_and_update()? {
+            sock_in = Some(PullSocket::connect(&endpoint)?);
+        }
     }
 
     let ctx = zmq::Context::new();
@@ -61,6 +61,19 @@ async fn do_pump(
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
+            Ok(_) = enabled.changed() => {
+                let endpoint = target_endpoint.borrow_and_update()?;
+                let enabled = enabled.borrow_and_update()?;
+                if enabled && sock_in.is_none() {
+                    // Turning on. Connect to target again
+                    debug!("Message pump enabled via PV. Connecting to {endpoint}");
+                    sock_in = Some(PullSocket::connect(&endpoint)?);
+                } else if !enabled && let Some(socket) = sock_in.take() {
+                    // Turning off. Close down the input port.
+                    debug!("Message pump disabled. Closing down incoming ZMQ connection.");
+                    socket.close();
+                }
+            },
             Ok(_) = target_endpoint.changed() => {
                 // We have updated the target
                 let endpoint = target_endpoint.borrow_and_update().unwrap();
@@ -99,7 +112,11 @@ struct PumpHandle {
 }
 
 impl PumpHandle {
-    fn start(target_endpoint: Watcher<String>, out_push_endpoint: &str) -> Self {
+    fn start(
+        enabled: Watcher<bool>,
+        target_endpoint: Watcher<String>,
+        out_push_endpoint: &str,
+    ) -> Self {
         let stop = CancellationToken::new();
         let inner_stop = stop.clone();
         let inner_out_endpoint = out_push_endpoint.to_string();
@@ -107,9 +124,15 @@ impl PumpHandle {
         let handle = Some(std::thread::spawn(move || {
             let rt = runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async move {
-                do_pump(target_endpoint, &inner_out_endpoint, inner_stop, tx)
-                    .await
-                    .unwrap();
+                do_pump(
+                    enabled,
+                    target_endpoint,
+                    &inner_out_endpoint,
+                    inner_stop,
+                    tx,
+                )
+                .await
+                .unwrap();
             })
         }));
         Self {
@@ -119,6 +142,8 @@ impl PumpHandle {
             multipart_pending: Vec::new(),
         }
     }
+
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         self.stop.cancel();
         self.handle.take().map(|h| h.join());
@@ -135,7 +160,7 @@ impl PumpHandle {
     /// message will be returned.
     pub async fn recv_multipart(&mut self) -> Option<Vec<Vec<u8>>> {
         loop {
-            match self.messages.recv().await {
+            match self.recv().await {
                 Some(msg) => {
                     let is_more = msg.is_more;
                     self.multipart_pending.push(msg.data);
@@ -179,19 +204,12 @@ async fn main() -> Result<()> {
         .build()
         .unwrap()
         .watch();
-    let mut enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
+    let enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
 
     let _server = ServerBuilder::new(library).start().await.unwrap();
-    let mut pump = PumpHandle::start(target, "tcp://0.0.0.0:9999");
+    let mut pump = PumpHandle::start(enabled, target, "tcp://0.0.0.0:9999");
     loop {
         tokio::select! {
-            Ok(_) = enabled.changed() => {
-                if enabled.borrow_and_update().unwrap() {
-
-                } else {
-
-                }
-            },
             Some(messages) = pump.recv_multipart() => {
                 println!("Received: {} messages, size: {}", messages.len(),  messages.iter().map(|m| m.len().to_string()).collect::<Vec<_>>().join(", "));
             }
