@@ -29,6 +29,9 @@ impl PullSocket {
                     // Spin these up on the same thread, as Socket should be !Send
                     let context = zmq::Context::new();
                     let socket = context.socket(zmq::PULL).unwrap();
+                    socket
+                        .monitor("inproc://monitor.req", zmq::SocketEvent::ALL as i32)
+                        .unwrap();
                     socket.connect(&inner_endpoint).unwrap();
                     socket.set_rcvtimeo(100).unwrap();
                     inner_recv(socket, inner_token, tx);

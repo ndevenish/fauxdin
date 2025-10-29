@@ -1,11 +1,14 @@
-use std::thread::JoinHandle;
+use std::{
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
 use fauxdin::zmq::PullSocket;
 use tokio::{runtime, sync::mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace};
 use tracing_subscriber::EnvFilter;
 
 /// Asynchronously call recv, if the argument is Some()
@@ -143,7 +146,6 @@ impl PumpHandle {
         }
     }
 
-    #[allow(dead_code)]
     pub fn stop(&mut self) {
         self.stop.cancel();
         self.handle.take().map(|h| h.join());
@@ -162,6 +164,11 @@ impl PumpHandle {
         loop {
             match self.recv().await {
                 Some(msg) => {
+                    // println!(
+                    //     "Got message {} bytes, more: {:?}",
+                    //     msg.data.len(),
+                    //     msg.is_more
+                    // );
                     let is_more = msg.is_more;
                     self.multipart_pending.push(msg.data);
                     // Keep looping here until we have all the messages
@@ -184,7 +191,7 @@ impl PumpHandle {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::default()
@@ -204,15 +211,47 @@ async fn main() -> Result<()> {
         .build()
         .unwrap()
         .watch();
-    let enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
+    let mut enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
+
+    // Spawn a thread to handle monitor events
+    let _monitor_thread = thread::spawn(move || {
+        let ctx = zmq::Context::new();
+        let monitor = ctx.socket(zmq::PAIR).unwrap();
+        monitor.connect("inproc://monitor.req").unwrap();
+
+        loop {
+            match monitor.recv_msg(0) {
+                Ok(event) => {
+                    println!("Monitor event: {:?}", event);
+                    // if let Some(addr) = event.addr {
+                    //     println!("  Address: {}", addr);
+                    // }
+                }
+                Err(e) => {
+                    eprintln!("Monitor error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+    thread::sleep(Duration::from_millis(100));
 
     let _server = ServerBuilder::new(library).start().await.unwrap();
-    let mut pump = PumpHandle::start(enabled, target, "tcp://0.0.0.0:9999");
+    let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9999");
     loop {
         tokio::select! {
-            Some(messages) = pump.recv_multipart() => {
-                println!("Received: {} messages, size: {}", messages.len(),  messages.iter().map(|m| m.len().to_string()).collect::<Vec<_>>().join(", "));
+            _ = enabled.changed() => {
+                println!("Enable signal changed");
+            },
+            m = pump.recv_multipart() => match m {
+                Some(messages) => println!("Received: {} messages, size: {}", messages.len(),  messages.iter().map(|m| m.len().to_string()).collect::<Vec<_>>().join(", ")),
+                None => {
+                    error!("Internal receiver terminated prematurely");
+                    break;
+                }
             }
         }
     }
+    pump.stop();
+    Ok(())
 }
