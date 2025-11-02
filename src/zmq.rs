@@ -1,12 +1,50 @@
-use std::{panic, thread};
+use std::{panic, thread, time::Duration};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, warn};
+
+pub use safesocket::Socket;
+
+#[allow(clippy::disallowed_types)]
+mod safesocket {
+    use std::{marker::PhantomData, ops::Deref, rc::Rc};
+
+    /// Basic newtype wrapper of zmq::Socket that correctly marks the socket as !Sync and !Send
+    pub struct Socket {
+        inner: zmq::Socket,
+        _nosend: PhantomData<Rc<()>>,
+    }
+
+    impl Deref for Socket {
+        type Target = zmq::Socket;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+    impl Socket {
+        pub fn new(socket: zmq::Socket) -> Self {
+            Self {
+                inner: socket,
+                _nosend: PhantomData,
+            }
+        }
+        pub fn into_inner(self) -> zmq::Socket {
+            self.inner
+        }
+        pub fn as_inner(&self) -> &zmq::Socket {
+            &self.inner
+        }
+        pub fn as_inner_mut(&mut self) -> &zmq::Socket {
+            &self.inner
+        }
+    }
+}
 
 pub struct PullSocket {
-    recv_task: Option<thread::JoinHandle<()>>,
+    pub recv_task: Option<thread::JoinHandle<()>>,
     /// Token cancelled when the recv loop has finished
     fin_token: CancellationToken,
     cancel: CancellationToken,
@@ -26,17 +64,27 @@ impl PullSocket {
         Ok(PullSocket {
             recv_task: Some(thread::spawn(move || {
                 let result = panic::catch_unwind(move || {
+                    let context = zmq::Context::new();
+                    println!("A: Context (thread {:?})", thread_id::get());
+                    let socket = context.socket(zmq::PULL).unwrap();
+                    println!("B: Socket");
+                    socket.connect("tcp://127.0.0.1:9999").unwrap();
+                    println!("C: Connect");
+                    let mut msg = zmq::Message::new();
+                    println!("D: Message");
+                    println!("-> {:?}: {:?}", socket.recv(&mut msg, 0), msg);
+
                     // Spin these up on the same thread, as Socket should be !Send
                     let context = zmq::Context::new();
-                    let socket = context.socket(zmq::PULL).unwrap();
-                    socket
-                        .monitor("inproc://monitor.req", zmq::SocketEvent::ALL as i32)
-                        .unwrap();
-                    socket.connect(&inner_endpoint).unwrap();
-                    socket.set_rcvtimeo(100).unwrap();
+                    let socket = safesocket::Socket::new(context.socket(zmq::PULL).unwrap());
+                    // socket.set_rcvtimeo(100).unwrap();
+                    println!("Connect: {:?}", socket.connect(&inner_endpoint));
+                    let mut msg = zmq::Message::new();
+                    println!("Message after connect: {:?}", socket.recv(&mut msg, 0));
                     inner_recv(socket, inner_token, tx);
                 });
                 inner_fin_token.cancel();
+                println!("Closing thread");
                 if let Err(payload) = result {
                     panic::resume_unwind(payload);
                 }
@@ -98,28 +146,31 @@ impl Drop for PullSocket {
 
 /// Inner actor to handle recv messages
 fn inner_recv(
-    socket: zmq::Socket,
+    socket: safesocket::Socket,
     token: CancellationToken,
     sender: mpsc::UnboundedSender<zmq::Message>,
 ) {
     while !token.is_cancelled() {
+        println!("Inner receive");
         let mut msg = zmq::Message::new();
         match socket.recv(&mut msg, 0) {
             Ok(_) => {
+                println!("Got message");
                 if sender.send(msg).is_err() {
-                    println!("Error: Failed to send");
                     break;
                 }
             }
             Err(zmq::Error::EAGAIN) => {
+                println!("Waiting for ZMQ still");
                 continue;
             }
             Err(e) => {
-                warn!("Unexpected return from zmq_recv: {e}");
+                error!("Unexpected return from zmq_recv: {e}");
                 break;
             }
         }
     }
+    println!("Ending inner_recv");
 }
 
 // struct PushSocket {

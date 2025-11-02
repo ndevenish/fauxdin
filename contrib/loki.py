@@ -8,6 +8,7 @@
 # ]
 # ///
 from pathlib import Path
+import threading
 import h5py
 import zmq
 import sys
@@ -16,6 +17,7 @@ import os
 import random
 from argparse import ArgumentParser
 from tqdm import tqdm
+from zmq.utils.monitor import recv_monitor_message
 
 # we need a series ID for this but it does not really matter what it is
 # so long as it is actually constant for a given run
@@ -155,6 +157,34 @@ def make_send_end(socket):
     socket.send_multipart((part1,))
 
 
+EVENT_MAP = {}
+print("Event names:")
+for name in dir(zmq):
+    if name.startswith("EVENT_"):
+        value = getattr(zmq, name)
+        print(f"{name:21} : {value:4}")
+        EVENT_MAP[value] = name
+
+
+def monitor_socket(monitor):
+    """Receive and log all socket monitor events."""
+    print("Starting monitor thread")
+    while True:
+        try:
+            event = recv_monitor_message(monitor)
+            evt = event["event"]
+            evt_name = EVENT_MAP.get(evt, "UNKNOWN")
+            addr = event.get("addr", "")
+            print(f"[MONITOR] Event: {evt_name} ({evt}) - Address: {addr}")
+        except zmq.error.Again:
+            # No event available right now
+            print("AGAIN")
+            continue
+        except zmq.error.ZMQError:
+            # Monitor socket closed
+            break
+
+
 def main():
     """Read data from an Eiger HDF5 file (assuming DLS structure) and publish
     data over zeroMQ as an ersatz SIMPLON 1.8 API data stream."""
@@ -179,6 +209,15 @@ def main():
     socket = context.socket(zmq.PUSH)
     # socket.setsockopt(zmq.HEARTBEAT_IVL, 1000)
     socket.bind("tcp://127.0.0.1:9999")
+
+    socket.monitor("inproc://monitor.push", zmq.EVENT_ALL)
+    # Create a PAIR socket to receive monitor events
+    monitor = context.socket(zmq.PAIR)
+    monitor.connect("inproc://monitor.push")
+    # Start the monitor thread
+    t = threading.Thread(target=monitor_socket, args=(monitor,), daemon=True)
+    t.start()
+
     make_send_header(socket, meta)
     make_send_data(socket, nxs)
     make_send_end(socket)

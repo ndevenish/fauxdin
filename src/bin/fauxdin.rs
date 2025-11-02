@@ -1,3 +1,4 @@
+use core::panic;
 use std::{
     thread::{self, JoinHandle},
     time::Duration,
@@ -5,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
-use fauxdin::zmq::PullSocket;
+use fauxdin::zmq::{PullSocket, Socket};
 use tokio::{runtime, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
@@ -15,7 +16,10 @@ use tracing_subscriber::EnvFilter;
 async fn maybe_recv(t: &mut Option<PullSocket>) -> Option<Option<zmq::Message>> {
     match t {
         Some(socket) => Some(socket.recv().await),
-        None => None,
+        None => {
+            println!("Maybe receive is None");
+            None
+        }
     }
 }
 // /// Asynchronously call recv_multipart, if the argument is Some()
@@ -54,17 +58,22 @@ async fn do_pump(
         let endpoint = target_endpoint.borrow_and_update()?;
         if !endpoint.is_empty() && enabled.borrow_and_update()? {
             sock_in = Some(PullSocket::connect(&endpoint)?);
+            println!("Blocking main thread to join");
+            sock_in.unwrap().recv_task.take().unwrap().join().unwrap();
+            panic!("End");
         }
     }
 
     let ctx = zmq::Context::new();
-    let sock_out = ctx.socket(zmq::SocketType::PUSH)?;
+    let sock_out = Socket::new(ctx.socket(zmq::SocketType::PUSH)?);
     sock_out.bind(push_endpoint)?;
-
+    println!("Pump starting");
     loop {
+        println!("Pump loop");
         tokio::select! {
             _ = stop.cancelled() => break,
             Ok(_) = enabled.changed() => {
+                println!("Enabled changed");
                 let endpoint = target_endpoint.borrow_and_update()?;
                 let enabled = enabled.borrow_and_update()?;
                 if enabled && sock_in.is_none() {
@@ -95,15 +104,16 @@ async fn do_pump(
                 // it fails, because otherwise we are just a message
                 // pump with no way to resume mirroring - meaning that
                 // we will eventually have to terminate anyway.
+                println!("Got message in fauxdin");
                 copy_to.send((&msg).into()).expect("Failed to mirror messages: Was it dropped without clean shutdown?");
                 let get_more = msg.get_more();
                 // Equally, failing to pass on the message is also a fatal error
                 trace!("Forwarded {} byte message to output.", msg.len());
                 sock_out.send(msg, if get_more { zmq::SNDMORE } else { 0 }).unwrap();
-            }
-
+            },
         }
     }
+    println!("Pump ended");
     Ok(())
 }
 
@@ -124,6 +134,7 @@ impl PumpHandle {
         let inner_stop = stop.clone();
         let inner_out_endpoint = out_push_endpoint.to_string();
         let (tx, rx) = mpsc::unbounded_channel();
+        // Start the pump in it's own current thread
         let handle = Some(std::thread::spawn(move || {
             let rt = runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async move {
@@ -203,6 +214,7 @@ async fn main() -> Result<()> {
             )
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    // console_subscriber::init();
 
     let mut library = epicars::providers::IntercomProvider::new();
     let target: Watcher<String> = library
@@ -213,29 +225,6 @@ async fn main() -> Result<()> {
         .watch();
     let mut enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
 
-    // Spawn a thread to handle monitor events
-    let _monitor_thread = thread::spawn(move || {
-        let ctx = zmq::Context::new();
-        let monitor = ctx.socket(zmq::PAIR).unwrap();
-        monitor.connect("inproc://monitor.req").unwrap();
-
-        loop {
-            match monitor.recv_msg(0) {
-                Ok(event) => {
-                    println!("Monitor event: {:?}", event);
-                    // if let Some(addr) = event.addr {
-                    //     println!("  Address: {}", addr);
-                    // }
-                }
-                Err(e) => {
-                    eprintln!("Monitor error: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-    thread::sleep(Duration::from_millis(100));
-
     let _server = ServerBuilder::new(library).start().await.unwrap();
     let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9999");
     loop {
@@ -244,7 +233,7 @@ async fn main() -> Result<()> {
                 println!("Enable signal changed");
             },
             m = pump.recv_multipart() => match m {
-                Some(messages) => println!("Received: {} messages, size: {}", messages.len(),  messages.iter().map(|m| m.len().to_string()).collect::<Vec<_>>().join(", ")),
+                Some(messages) => println!("Received: {} messages, sizes: [{}]", messages.len(),  messages.iter().map(|m| m.len().to_string()).collect::<Vec<_>>().join(", ")),
                 None => {
                     error!("Internal receiver terminated prematurely");
                     break;
