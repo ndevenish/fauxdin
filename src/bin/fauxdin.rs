@@ -15,7 +15,10 @@ use tracing_subscriber::EnvFilter;
 /// Asynchronously call recv, if the argument is Some()
 async fn maybe_recv(t: &mut Option<PullSocket>) -> Option<Option<zmq::Message>> {
     match t {
-        Some(socket) => Some(socket.recv().await),
+        Some(socket) => {
+            println!("maybe_recv waiting because socket has value");
+            Some(socket.recv().await)
+        }
         None => {
             println!("Maybe receive is None");
             None
@@ -57,16 +60,19 @@ async fn do_pump(
     {
         let endpoint = target_endpoint.borrow_and_update()?;
         if !endpoint.is_empty() && enabled.borrow_and_update()? {
+            println!("Creating initial socket");
             sock_in = Some(PullSocket::connect(&endpoint)?);
-            println!("Blocking main thread to join");
-            sock_in.unwrap().recv_task.take().unwrap().join().unwrap();
-            panic!("End");
+            println!("Post-creation");
+            // println!("Blocking main thread to join");
+            // sock_in.unwrap().recv_task.take().unwrap().join().unwrap();
+            // panic!("End");
         }
     }
 
     let ctx = zmq::Context::new();
     let sock_out = Socket::new(ctx.socket(zmq::SocketType::PUSH)?);
     sock_out.bind(push_endpoint)?;
+
     println!("Pump starting");
     loop {
         println!("Pump loop");
@@ -184,6 +190,10 @@ impl PumpHandle {
                     self.multipart_pending.push(msg.data);
                     // Keep looping here until we have all the messages
                     if is_more {
+                        println!(
+                            "Got another multipart, part {}",
+                            self.multipart_pending.len()
+                        );
                         continue;
                     } else {
                         break;
@@ -226,7 +236,7 @@ async fn main() -> Result<()> {
     let mut enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
 
     let _server = ServerBuilder::new(library).start().await.unwrap();
-    let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9999");
+    let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9998");
     loop {
         tokio::select! {
             _ = enabled.changed() => {

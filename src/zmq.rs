@@ -1,4 +1,4 @@
-use std::{panic, thread, time::Duration};
+use std::{io::Write, panic, thread, time::Duration};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -65,22 +65,9 @@ impl PullSocket {
             recv_task: Some(thread::spawn(move || {
                 let result = panic::catch_unwind(move || {
                     let context = zmq::Context::new();
-                    println!("A: Context (thread {:?})", thread_id::get());
-                    let socket = context.socket(zmq::PULL).unwrap();
-                    println!("B: Socket");
-                    socket.connect("tcp://127.0.0.1:9999").unwrap();
-                    println!("C: Connect");
-                    let mut msg = zmq::Message::new();
-                    println!("D: Message");
-                    println!("-> {:?}: {:?}", socket.recv(&mut msg, 0), msg);
-
-                    // Spin these up on the same thread, as Socket should be !Send
-                    let context = zmq::Context::new();
                     let socket = safesocket::Socket::new(context.socket(zmq::PULL).unwrap());
-                    // socket.set_rcvtimeo(100).unwrap();
-                    println!("Connect: {:?}", socket.connect(&inner_endpoint));
-                    let mut msg = zmq::Message::new();
-                    println!("Message after connect: {:?}", socket.recv(&mut msg, 0));
+                    socket.set_rcvtimeo(100).unwrap();
+                    socket.connect(&inner_endpoint).unwrap();
                     inner_recv(socket, inner_token, tx);
                 });
                 inner_fin_token.cancel();
@@ -97,7 +84,9 @@ impl PullSocket {
     }
     pub async fn recv(&mut self) -> Option<zmq::Message> {
         if !self.multipart_pending.is_empty() {
-            // We were asked for a single message before the multipart ended... return it
+            // We are partway through receiving a multipart message (e.g.
+            // the awaiting future was cancelled before finishing). Just
+            // return the first message.
             Some(self.multipart_pending.remove(0))
         } else {
             self.recv.recv().await
@@ -143,6 +132,23 @@ impl Drop for PullSocket {
         self.cancel.cancel();
     }
 }
+pub fn ball_spinner() -> impl Iterator<Item = &'static str> {
+    [
+        "( ●    )",
+        "(  ●   )",
+        "(   ●  )",
+        "(    ● )",
+        "(     ●)",
+        "(    ● )",
+        "(   ●  )",
+        "(  ●   )",
+        "( ●    )",
+        "(●     )",
+    ]
+    .iter()
+    .copied()
+    .cycle()
+}
 
 /// Inner actor to handle recv messages
 fn inner_recv(
@@ -150,18 +156,24 @@ fn inner_recv(
     token: CancellationToken,
     sender: mpsc::UnboundedSender<zmq::Message>,
 ) {
+    let mut spinner = ball_spinner();
+    let mut num = 0usize;
     while !token.is_cancelled() {
-        println!("Inner receive");
+        // println!("Inner receive: Loop start");
+        // print!("  inner_recv {}\r", spinner.next().unwrap());
+        // let _ = std::io::stdout().flush();
+
         let mut msg = zmq::Message::new();
         match socket.recv(&mut msg, 0) {
             Ok(_) => {
-                println!("Got message");
+                print!(" Inner receive: Got message {}\r", num);
+                num += 1;
                 if sender.send(msg).is_err() {
                     break;
                 }
             }
             Err(zmq::Error::EAGAIN) => {
-                println!("Waiting for ZMQ still");
+                // println!("Inner receive: Waiting for ZMQ, got EAGAIN");
                 continue;
             }
             Err(e) => {
@@ -170,7 +182,7 @@ fn inner_recv(
             }
         }
     }
-    println!("Ending inner_recv");
+    println!("Inner receive: Ending");
 }
 
 // struct PushSocket {
