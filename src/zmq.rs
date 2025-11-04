@@ -1,7 +1,19 @@
-use std::{io::Write, panic, thread, time::Duration};
+use std::{
+    io::Write,
+    panic,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::Result;
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit, broadcast, mpsc, watch},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
@@ -43,6 +55,88 @@ mod safesocket {
     }
 }
 
+pub struct PushSocket {
+    cancel_token: CancellationToken,
+    /// Queue for messages.
+    tx: mpsc::UnboundedSender<(zmq::Message, OwnedSemaphorePermit)>,
+    tx_permits: Arc<Semaphore>,
+    /// The total allowed enqueued messages. The actual number may be higher
+    /// than this if it was resized while above the new capacity.
+    buffer_size: usize,
+    // How many permits we need to drop before we can send again.
+    buffer_debt: AtomicUsize,
+}
+impl PushSocket {
+    pub fn bind(
+        endpoint: &str,
+        context: zmq::Context,
+        presocket_queue_length: usize,
+    ) -> PushSocket {
+        let (tx, rx) = mpsc::unbounded_channel();
+        PushSocket {
+            cancel_token: CancellationToken::new(),
+            tx,
+            tx_permits: Arc::new(Semaphore::new(presocket_queue_length)),
+            buffer_size: presocket_queue_length,
+            buffer_debt: 0.into(),
+        }
+    }
+
+    /// Attempt to send a message to the PUSH socket
+    ///
+    /// This will never block, but if the queue is full (or closed) will return
+    /// an associated Err.
+    pub fn try_send(
+        &self,
+        message: zmq::Message,
+    ) -> Result<(), mpsc::error::TrySendError<zmq::Message>> {
+        // First, if we have any leftover permits to drop because of a resize
+        let debt = self.buffer_debt.load(Ordering::Relaxed);
+        if debt > 0 {
+            self.buffer_debt
+                .fetch_sub(self.tx_permits.forget_permits(debt), Ordering::Relaxed);
+        }
+        let Ok(permit) = self.tx_permits.clone().try_acquire_owned() else {
+            return Err(mpsc::error::TrySendError::Full(message));
+        };
+        // We have a permit to send
+        if let Err(mpsc::error::SendError((message, _))) = self.tx.send((message, permit)) {
+            // We failed to send, which means the channel was closed
+            return Err(mpsc::error::TrySendError::Closed(message));
+        }
+        Ok(())
+    }
+    /// Alter the internal buffer capacity.
+    ///
+    /// If lowering below the current queue length, this will prevent
+    /// messages from being sent until it drops below the new value.
+    pub fn set_buffer_length(&mut self, new_length: usize) {
+        if new_length == self.buffer_size {
+        } else if new_length > self.buffer_size {
+            // Work out any interactions with any previous outstanding debt
+            let mut debt = self.buffer_debt.load(Ordering::SeqCst);
+            let mut to_add = new_length - self.buffer_size;
+            if to_add >= debt {
+                to_add -= debt;
+                debt = 0;
+            } else {
+                to_add = 0;
+                debt -= to_add;
+            }
+            if to_add > 0 {
+                self.tx_permits.add_permits(to_add);
+            }
+            self.buffer_debt.store(debt, Ordering::SeqCst);
+        } else {
+            // Reducing buffer size
+            let to_forget = self.buffer_size - new_length;
+            let debt = to_forget - self.tx_permits.forget_permits(to_forget);
+            self.buffer_debt.store(debt, Ordering::Relaxed);
+            self.buffer_size = new_length;
+        }
+    }
+}
+
 pub struct PullSocket {
     cancel: CancellationToken,
     recv: mpsc::UnboundedReceiver<zmq::Message>,
@@ -50,7 +144,7 @@ pub struct PullSocket {
 }
 
 impl PullSocket {
-    pub fn connect(endpoint: &str, context: zmq::Context, tasks : &mut JoinSet<()>) -> Result<Self> {
+    pub fn connect(endpoint: &str, context: zmq::Context, tasks: &mut JoinSet<()>) -> Result<Self> {
         let token = CancellationToken::new();
         let inner_token = token.clone();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -113,12 +207,13 @@ impl PullSocket {
 
     pub async fn close(mut self) {
         self.cancel.cancel();
-
-        self.recv_task.take().map(|v| v.join());
+        todo!();
+        // self.recv_task.take().map(|v| v.join());
     }
     /// Wait (Cancel-safe) for the socket to be closed.
     pub async fn closed(&self) {
-        self.recv_task.
+        // self.recv_task.
+        todo!();
     }
 }
 
