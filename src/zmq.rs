@@ -1,7 +1,7 @@
 use std::{io::Write, panic, thread, time::Duration};
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
@@ -44,39 +44,33 @@ mod safesocket {
 }
 
 pub struct PullSocket {
-    pub recv_task: Option<thread::JoinHandle<()>>,
-    /// Token cancelled when the recv loop has finished
-    fin_token: CancellationToken,
     cancel: CancellationToken,
     recv: mpsc::UnboundedReceiver<zmq::Message>,
     multipart_pending: Vec<zmq::Message>,
 }
 
 impl PullSocket {
-    pub fn connect(endpoint: &str) -> Result<Self> {
+    pub fn connect(endpoint: &str, context: zmq::Context, tasks : &mut JoinSet<()>) -> Result<Self> {
         let token = CancellationToken::new();
         let inner_token = token.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         // let (closed_tx, closed_rx) = oneshot::channel();
-        let fin_token = CancellationToken::new();
-        let inner_fin_token = fin_token.clone();
+        // let fin_token = CancellationToken::new();
+        // let inner_fin_token = fin_token.clone();
         let inner_endpoint = endpoint.to_string();
-        Ok(PullSocket {
-            recv_task: Some(thread::spawn(move || {
-                let result = panic::catch_unwind(move || {
-                    let context = zmq::Context::new();
-                    let socket = safesocket::Socket::new(context.socket(zmq::PULL).unwrap());
-                    socket.set_rcvtimeo(100).unwrap();
-                    socket.connect(&inner_endpoint).unwrap();
-                    inner_recv(socket, inner_token, tx);
-                });
-                inner_fin_token.cancel();
+        tasks.spawn_blocking(|| {
+            thread::spawn(move || {
+                let socket = safesocket::Socket::new(context.socket(zmq::PULL).unwrap());
+                socket.set_rcvtimeo(100).unwrap();
+                socket.connect(&inner_endpoint).unwrap();
+                inner_recv(socket, inner_token, tx);
                 println!("Closing thread");
-                if let Err(payload) = result {
-                    panic::resume_unwind(payload);
-                }
-            })),
-            fin_token,
+            })
+            .join()
+            .unwrap();
+        });
+
+        Ok(PullSocket {
             cancel: token,
             recv: rx,
             multipart_pending: Vec::new(),
@@ -117,13 +111,14 @@ impl PullSocket {
         Some(std::mem::take(&mut self.multipart_pending))
     }
 
-    pub fn close(mut self) {
+    pub async fn close(mut self) {
         self.cancel.cancel();
+
         self.recv_task.take().map(|v| v.join());
     }
     /// Wait (Cancel-safe) for the socket to be closed.
     pub async fn closed(&self) {
-        self.fin_token.cancelled().await;
+        self.recv_task.
     }
 }
 
@@ -158,6 +153,7 @@ fn inner_recv(
 ) {
     let mut spinner = ball_spinner();
     let mut num = 0usize;
+    let mut num_fin = 0usize;
     while !token.is_cancelled() {
         // println!("Inner receive: Loop start");
         // print!("  inner_recv {}\r", spinner.next().unwrap());
@@ -166,11 +162,15 @@ fn inner_recv(
         let mut msg = zmq::Message::new();
         match socket.recv(&mut msg, 0) {
             Ok(_) => {
-                print!(" Inner receive: Got message {}\r", num);
-                num += 1;
+                let is_more = msg.get_more();
                 if sender.send(msg).is_err() {
                     break;
                 }
+                if !is_more {
+                    num_fin += 1;
+                }
+                num += 1;
+                print!(" Inner receive: Got message {} ({} final)\r", num, num_fin);
             }
             Err(zmq::Error::EAGAIN) => {
                 // println!("Inner receive: Waiting for ZMQ, got EAGAIN");

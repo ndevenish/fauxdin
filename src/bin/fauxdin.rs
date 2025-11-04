@@ -7,7 +7,7 @@ use std::{
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
 use fauxdin::zmq::{PullSocket, Socket};
-use tokio::{runtime, sync::mpsc};
+use tokio::{runtime, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 use tracing_subscriber::EnvFilter;
@@ -46,7 +46,12 @@ impl From<&zmq::Message> for Message {
         }
     }
 }
-
+fn start_pusher(
+    context: zmq::Context,
+    stop: CancellationToken,
+    endpoint: &str,
+) -> mpsc::Sender<Message> {
+}
 /// Handle movement of messages between input and output ZMQ streams
 async fn do_pump(
     mut enabled: Watcher<bool>,
@@ -55,21 +60,25 @@ async fn do_pump(
     stop: CancellationToken,
     copy_to: mpsc::UnboundedSender<Message>,
 ) -> Result<()> {
+    let ctx = zmq::Context::new();
+
     // Make the sockets
     let mut sock_in = None;
     {
         let endpoint = target_endpoint.borrow_and_update()?;
         if !endpoint.is_empty() && enabled.borrow_and_update()? {
-            println!("Creating initial socket");
-            sock_in = Some(PullSocket::connect(&endpoint)?);
-            println!("Post-creation");
-            // println!("Blocking main thread to join");
-            // sock_in.unwrap().recv_task.take().unwrap().join().unwrap();
-            // panic!("End");
+            // println!("Creating initial socket");
+            sock_in = Some(PullSocket::connect(&endpoint, Some(ctx.clone()))?);
+            // println!("Post-creation");
         }
     }
 
-    let ctx = zmq::Context::new();
+    let tasks = JoinSet::new();
+    let handle = std::thread::spawn(|| panic!("Some error"));
+    tasks.spawn_blocking(async move || {
+        handle.join().unwrap();
+    });
+
     let sock_out = Socket::new(ctx.socket(zmq::SocketType::PUSH)?);
     sock_out.bind(push_endpoint)?;
 
@@ -85,7 +94,7 @@ async fn do_pump(
                 if enabled && sock_in.is_none() {
                     // Turning on. Connect to target again
                     debug!("Message pump enabled via PV. Connecting to {endpoint}");
-                    sock_in = Some(PullSocket::connect(&endpoint)?);
+                    sock_in = Some(PullSocket::connect(&endpoint, Some(ctx.clone()))?);
                 } else if !enabled && let Some(socket) = sock_in.take() {
                     // Turning off. Close down the input port.
                     debug!("Message pump disabled. Closing down incoming ZMQ connection.");
@@ -112,10 +121,13 @@ async fn do_pump(
                 // we will eventually have to terminate anyway.
                 println!("Got message in fauxdin");
                 copy_to.send((&msg).into()).expect("Failed to mirror messages: Was it dropped without clean shutdown?");
+                println!("---- Sent onwards");
                 let get_more = msg.get_more();
                 // Equally, failing to pass on the message is also a fatal error
                 trace!("Forwarded {} byte message to output.", msg.len());
+
                 sock_out.send(msg, if get_more { zmq::SNDMORE } else { 0 }).unwrap();
+                // println!("Send to out socket\n");
             },
         }
     }
