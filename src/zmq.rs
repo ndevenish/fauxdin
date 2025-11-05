@@ -11,11 +11,13 @@ use std::{
 
 use anyhow::Result;
 use tokio::{
+    runtime::Builder,
+    select,
     sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit, broadcast, mpsc, watch},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{debug, error};
 
 pub use safesocket::Socket;
 
@@ -71,8 +73,53 @@ impl PushSocket {
         endpoint: &str,
         context: zmq::Context,
         presocket_queue_length: usize,
+        tasks: &mut JoinSet<()>,
     ) -> PushSocket {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let cancel_token = CancellationToken::new();
+        let inner_cancel_token = cancel_token.clone();
+        let inner_endpoint = endpoint.to_string();
+        tasks.spawn_blocking(|| {
+            thread::spawn(move || {
+                let rt = Builder::new_current_thread().build().unwrap();
+
+                let sock_out = Socket::new(context.socket(zmq::SocketType::PUSH).unwrap());
+                sock_out.bind(&inner_endpoint).unwrap();
+
+                rt.block_on(async move {
+                    loop {
+                        let msg = select! {
+                            _ = inner_cancel_token.cancelled() => {break;},
+                            maybe_msg = rx.recv() => match maybe_msg {
+                                Some((msg, _)) => msg,
+                                None => break,
+                            }
+                        };
+                        // Now, we want to send this message into the output
+                        // socket. But, we need to be careful to do this in
+                        // a way that we can cancel if need be. So, try to send,
+                        // and wait a short backoff if we fail.
+                        loop {
+                            match sock_out.send(msg, zmq::DONTWAIT) {
+                                Ok(()) => break,
+                                Err(zmq::Error::EAGAIN) => {
+                                    select! {
+                                        _ = inner_cancel_token.cancelled() => break,
+                                        _ = tokio::time::sleep(Duration::from_millis(50)) => (),
+                                    }
+                                }
+                                Err(e) => panic!("Got unexpected error trying to send: {e}"),
+                            }
+                        }
+                    }
+                    debug!("Closing PushSocket thread");
+                });
+            })
+            .join()
+            .unwrap();
+        });
+
         PushSocket {
             cancel_token: CancellationToken::new(),
             tx,
