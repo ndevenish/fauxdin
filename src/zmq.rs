@@ -1,9 +1,8 @@
 use std::{
-    io::Write,
     panic,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -13,13 +12,14 @@ use anyhow::Result;
 use tokio::{
     runtime::Builder,
     select,
-    sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit, broadcast, mpsc, watch},
-    task::JoinSet,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    task::{JoinError, JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 pub use safesocket::Socket;
+use zmq::Message;
 
 #[allow(clippy::disallowed_types)]
 mod safesocket {
@@ -65,59 +65,64 @@ pub struct PushSocket {
     /// The total allowed enqueued messages. The actual number may be higher
     /// than this if it was resized while above the new capacity.
     buffer_size: usize,
-    // How many permits we need to drop before we can send again.
+    /// How many permits we need to drop before we can send again.
     buffer_debt: AtomicUsize,
+    /// The inner loop join handle
+    inner_loop: JoinHandle<()>,
 }
 impl PushSocket {
     pub fn bind(
         endpoint: &str,
         context: zmq::Context,
         presocket_queue_length: usize,
-        tasks: &mut JoinSet<()>,
     ) -> PushSocket {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let cancel_token = CancellationToken::new();
         let inner_cancel_token = cancel_token.clone();
         let inner_endpoint = endpoint.to_string();
-        tasks.spawn_blocking(|| {
-            thread::spawn(move || {
-                let rt = Builder::new_current_thread().build().unwrap();
+        let inner_loop = tokio::task::spawn_blocking(move || {
+            let rt = Builder::new_current_thread().build().unwrap();
 
-                let sock_out = Socket::new(context.socket(zmq::SocketType::PUSH).unwrap());
-                sock_out.bind(&inner_endpoint).unwrap();
+            let sock_out = Socket::new(context.socket(zmq::SocketType::PUSH).unwrap());
+            sock_out.bind(&inner_endpoint).unwrap();
 
-                rt.block_on(async move {
+            rt.block_on(async move {
+                loop {
+                    let msg: Message = select! {
+                        _ = inner_cancel_token.cancelled() => {break;},
+                        maybe_msg = rx.recv() => match maybe_msg {
+                            Some((msg, _)) => msg,
+                            None => break,
+                        }
+                    };
+
+                    // Currently, rust zmq always swallows the message,
+                    // even on failure. So, pull the data out here and copy
+                    // it every time we try to send.
+                    // See: https://github.com/erickt/rust-zmq/issues/211
+                    let more_flag = if msg.get_more() { zmq::SNDMORE } else { 0 };
+                    let message_data = msg.to_vec();
+
+                    // Now, we want to send this message into the output
+                    // socket. But, we need to be careful to do this in
+                    // a way that we can cancel if need be. So, try to send,
+                    // and wait a short backoff if we fail.
                     loop {
-                        let msg = select! {
-                            _ = inner_cancel_token.cancelled() => {break;},
-                            maybe_msg = rx.recv() => match maybe_msg {
-                                Some((msg, _)) => msg,
-                                None => break,
-                            }
-                        };
-                        // Now, we want to send this message into the output
-                        // socket. But, we need to be careful to do this in
-                        // a way that we can cancel if need be. So, try to send,
-                        // and wait a short backoff if we fail.
-                        loop {
-                            match sock_out.send(msg, zmq::DONTWAIT) {
-                                Ok(()) => break,
-                                Err(zmq::Error::EAGAIN) => {
-                                    select! {
-                                        _ = inner_cancel_token.cancelled() => break,
-                                        _ = tokio::time::sleep(Duration::from_millis(50)) => (),
-                                    }
+                        match sock_out.send(&message_data, zmq::DONTWAIT | more_flag) {
+                            Ok(()) => break,
+                            Err(zmq::Error::EAGAIN) => {
+                                select! {
+                                    _ = inner_cancel_token.cancelled() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(50)) => (),
                                 }
-                                Err(e) => panic!("Got unexpected error trying to send: {e}"),
                             }
+                            Err(e) => panic!("Got unexpected error trying to send: {e}"),
                         }
                     }
-                    debug!("Closing PushSocket thread");
-                });
-            })
-            .join()
-            .unwrap();
+                }
+                debug!("Closing PushSocket thread");
+            });
         });
 
         PushSocket {
@@ -126,6 +131,7 @@ impl PushSocket {
             tx_permits: Arc::new(Semaphore::new(presocket_queue_length)),
             buffer_size: presocket_queue_length,
             buffer_debt: 0.into(),
+            inner_loop,
         }
     }
 
@@ -181,6 +187,16 @@ impl PushSocket {
             self.buffer_debt.store(debt, Ordering::Relaxed);
             self.buffer_size = new_length;
         }
+    }
+    /// Close the socket and wait for it finish closing
+    pub async fn close(self) {
+        self.cancel_token.cancel();
+
+        let _ = self.inner_loop.await;
+    }
+    /// Wait for the socket to close, cooperatively or forced
+    pub async fn closed(&mut self) -> Result<(), JoinError> {
+        (&mut self.inner_loop).await
     }
 }
 
@@ -269,23 +285,6 @@ impl Drop for PullSocket {
         self.cancel.cancel();
     }
 }
-pub fn ball_spinner() -> impl Iterator<Item = &'static str> {
-    [
-        "( ●    )",
-        "(  ●   )",
-        "(   ●  )",
-        "(    ● )",
-        "(     ●)",
-        "(    ● )",
-        "(   ●  )",
-        "(  ●   )",
-        "( ●    )",
-        "(●     )",
-    ]
-    .iter()
-    .copied()
-    .cycle()
-}
 
 /// Inner actor to handle recv messages
 fn inner_recv(
@@ -293,7 +292,6 @@ fn inner_recv(
     token: CancellationToken,
     sender: mpsc::UnboundedSender<zmq::Message>,
 ) {
-    let mut spinner = ball_spinner();
     let mut num = 0usize;
     let mut num_fin = 0usize;
     while !token.is_cancelled() {

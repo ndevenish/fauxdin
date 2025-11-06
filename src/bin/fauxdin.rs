@@ -1,8 +1,5 @@
 use core::panic;
-use std::{
-    thread::{self, JoinHandle},
-    time::Duration,
-};
+use std::thread::JoinHandle;
 
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
@@ -61,23 +58,15 @@ async fn do_pump(
     copy_to: mpsc::UnboundedSender<Message>,
 ) -> Result<()> {
     let ctx = zmq::Context::new();
-
+    let mut subtasks = JoinSet::new();
     // Make the sockets
     let mut sock_in = None;
     {
         let endpoint = target_endpoint.borrow_and_update()?;
         if !endpoint.is_empty() && enabled.borrow_and_update()? {
-            // println!("Creating initial socket");
-            sock_in = Some(PullSocket::connect(&endpoint, Some(ctx.clone()))?);
-            // println!("Post-creation");
+            sock_in = Some(PullSocket::connect(&endpoint, ctx.clone(), &mut subtasks)?);
         }
     }
-
-    let tasks = JoinSet::new();
-    let handle = std::thread::spawn(|| panic!("Some error"));
-    tasks.spawn_blocking(async move || {
-        handle.join().unwrap();
-    });
 
     let sock_out = Socket::new(ctx.socket(zmq::SocketType::PUSH)?);
     sock_out.bind(push_endpoint)?;
@@ -94,7 +83,7 @@ async fn do_pump(
                 if enabled && sock_in.is_none() {
                     // Turning on. Connect to target again
                     debug!("Message pump enabled via PV. Connecting to {endpoint}");
-                    sock_in = Some(PullSocket::connect(&endpoint, Some(ctx.clone()))?);
+                    sock_in = Some(PullSocket::connect(&endpoint, ctx.clone(), &mut subtasks)?);
                 } else if !enabled && let Some(socket) = sock_in.take() {
                     // Turning off. Close down the input port.
                     debug!("Message pump disabled. Closing down incoming ZMQ connection.");
@@ -111,7 +100,7 @@ async fn do_pump(
                     info!("Connection endpoint cleared, suspending connection");
                 } else {
                     info!("Connection target changed to {endpoint}, making new connection");
-                    sock_in = Some(PullSocket::connect(&endpoint)?);
+                    sock_in = Some(PullSocket::connect(&endpoint, ctx.clone(), &mut subtasks)?);
                 }
             },
             Some(Some(msg)) = maybe_recv(&mut sock_in) => {
