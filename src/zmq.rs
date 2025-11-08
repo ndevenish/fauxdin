@@ -13,50 +13,21 @@ use tokio::{
     runtime::Builder,
     select,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    task::{JoinError, JoinHandle, JoinSet},
+    task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-pub use safesocket::Socket;
 use zmq::Message;
 
-#[allow(clippy::disallowed_types)]
-mod safesocket {
-    use std::{marker::PhantomData, ops::Deref, rc::Rc};
-
-    /// Basic newtype wrapper of zmq::Socket that correctly marks the socket as !Sync and !Send
-    pub struct Socket {
-        inner: zmq::Socket,
-        _nosend: PhantomData<Rc<()>>,
-    }
-
-    impl Deref for Socket {
-        type Target = zmq::Socket;
-
-        fn deref(&self) -> &Self::Target {
-            &self.inner
-        }
-    }
-    impl Socket {
-        pub fn new(socket: zmq::Socket) -> Self {
-            Self {
-                inner: socket,
-                _nosend: PhantomData,
-            }
-        }
-        pub fn into_inner(self) -> zmq::Socket {
-            self.inner
-        }
-        pub fn as_inner(&self) -> &zmq::Socket {
-            &self.inner
-        }
-        pub fn as_inner_mut(&mut self) -> &zmq::Socket {
-            &self.inner
-        }
-    }
-}
-
+/// Wrapper for zmq PUSH socket sending data out of the program
+///
+/// PushSocket contains it's own (bounded) message buffer, alongside any ZMQ
+/// internal high water mark buffer. This means that you can definitively tell
+/// that the buffer is full (e.g. not being drained at all, or being drained
+/// slowly). This allows us to guarantee a set amount of message buffering, and
+/// avoids issues where the initial images might get dropped because the PUSH
+/// socket doesn't start buffering until it's seen a client.
 pub struct PushSocket {
     cancel_token: CancellationToken,
     /// Queue for messages.
@@ -68,23 +39,30 @@ pub struct PushSocket {
     /// How many permits we need to drop before we can send again.
     buffer_debt: AtomicUsize,
     /// The inner loop join handle
-    inner_loop: JoinHandle<()>,
+    inner_loop: Option<JoinHandle<()>>,
 }
 impl PushSocket {
+    /// Bind a zmq PUSH socket, given context and initial buffer length
+    ///
+    /// Regardless of ZeroMQ HWM settings or whether the socket is being
+    /// actively drained by an external client, `presocket_queue_length` items
+    /// can be buffered inside the [`PushSocket`]. This quantity can be adjusted
+    /// at run-time without reopening the socket.
     pub fn bind(
         endpoint: &str,
         context: zmq::Context,
+        cancel_token: CancellationToken,
         presocket_queue_length: usize,
     ) -> PushSocket {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let cancel_token = CancellationToken::new();
+        let cancel_token = cancel_token.child_token();
         let inner_cancel_token = cancel_token.clone();
         let inner_endpoint = endpoint.to_string();
         let inner_loop = tokio::task::spawn_blocking(move || {
             let rt = Builder::new_current_thread().build().unwrap();
 
-            let sock_out = Socket::new(context.socket(zmq::SocketType::PUSH).unwrap());
+            let sock_out = context.socket(zmq::SocketType::PUSH).unwrap();
             sock_out.bind(&inner_endpoint).unwrap();
 
             rt.block_on(async move {
@@ -131,7 +109,7 @@ impl PushSocket {
             tx_permits: Arc::new(Semaphore::new(presocket_queue_length)),
             buffer_size: presocket_queue_length,
             buffer_debt: 0.into(),
-            inner_loop,
+            inner_loop: Some(inner_loop),
         }
     }
 
@@ -188,15 +166,17 @@ impl PushSocket {
             self.buffer_size = new_length;
         }
     }
-    /// Close the socket and wait for it finish closing
-    pub async fn close(self) {
-        self.cancel_token.cancel();
 
-        let _ = self.inner_loop.await;
+    /// Close the socket and wait for it finish closing
+    pub fn close(mut self) -> JoinHandle<()> {
+        self.cancel_token.cancel();
+        self.inner_loop.take().unwrap()
     }
-    /// Wait for the socket to close, cooperatively or forced
-    pub async fn closed(&mut self) -> Result<(), JoinError> {
-        (&mut self.inner_loop).await
+}
+
+impl Drop for PushSocket {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
     }
 }
 
@@ -217,7 +197,7 @@ impl PullSocket {
         let inner_endpoint = endpoint.to_string();
         tasks.spawn_blocking(|| {
             thread::spawn(move || {
-                let socket = safesocket::Socket::new(context.socket(zmq::PULL).unwrap());
+                let socket = context.socket(zmq::PULL).unwrap();
                 socket.set_rcvtimeo(100).unwrap();
                 socket.connect(&inner_endpoint).unwrap();
                 inner_recv(socket, inner_token, tx);
@@ -288,7 +268,7 @@ impl Drop for PullSocket {
 
 /// Inner actor to handle recv messages
 fn inner_recv(
-    socket: safesocket::Socket,
+    socket: zmq::Socket,
     token: CancellationToken,
     sender: mpsc::UnboundedSender<zmq::Message>,
 ) {
