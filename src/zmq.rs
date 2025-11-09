@@ -12,13 +12,13 @@ use anyhow::Result;
 use tokio::{
     runtime::Builder,
     select,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use zmq::Message;
+use zmq::{Message, SocketType::PAIR};
 
 /// Wrapper for zmq PUSH socket sending data out of the program
 ///
@@ -46,26 +46,40 @@ impl PushSocket {
     ///
     /// Regardless of ZeroMQ HWM settings or whether the socket is being
     /// actively drained by an external client, `presocket_queue_length` items
-    /// can be buffered inside the [`PushSocket`]. This quantity can be adjusted
-    /// at run-time without reopening the socket.
-    pub fn bind(
+    /// can be buffered inside the [`PushSocket`]. This quantity can be
+    /// adjusted at run-time without reopening the socket.
+    ///
+    /// Awaiting will wait for the socket to be bound and the worker thread to
+    /// be started.
+    pub async fn bind(
         endpoint: &str,
         context: zmq::Context,
         cancel_token: CancellationToken,
         presocket_queue_length: usize,
-    ) -> PushSocket {
+    ) -> Result<PushSocket> {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
+        let (launch_tx, launch_rx) = oneshot::channel();
         let cancel_token = cancel_token.child_token();
         let inner_cancel_token = cancel_token.clone();
         let inner_endpoint = endpoint.to_string();
         let inner_loop = tokio::task::spawn_blocking(move || {
             let rt = Builder::new_current_thread().build().unwrap();
 
-            let sock_out = context.socket(zmq::SocketType::PUSH).unwrap();
-            sock_out.bind(&inner_endpoint).unwrap();
+            let sock_out = match context.socket(zmq::SocketType::PUSH) {
+                Ok(sock) => sock,
+                Err(e) => {
+                    let _ = launch_tx.send(Err(e));
+                    return;
+                }
+            };
+            if let Err(e) = sock_out.bind(&inner_endpoint) {
+                let _ = launch_tx.send(Err(e));
+                return;
+            }
 
             rt.block_on(async move {
+                let _ = launch_tx.send(Ok(()));
                 loop {
                     let msg: Message = select! {
                         _ = inner_cancel_token.cancelled() => {break;},
@@ -102,15 +116,16 @@ impl PushSocket {
                 debug!("Closing PushSocket thread");
             });
         });
-
-        PushSocket {
+        // Wait for the actual binding
+        launch_rx.await??;
+        Ok(PushSocket {
             cancel_token: CancellationToken::new(),
             tx,
             tx_permits: Arc::new(Semaphore::new(presocket_queue_length)),
             buffer_size: presocket_queue_length,
             buffer_debt: 0.into(),
             inner_loop: Some(inner_loop),
-        }
+        })
     }
 
     /// Attempt to send a message to the PUSH socket

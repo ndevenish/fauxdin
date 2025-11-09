@@ -3,7 +3,7 @@ use std::thread::JoinHandle;
 
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
-use fauxdin::zmq::{PullSocket, Socket};
+use fauxdin::zmq::{PullSocket, PushSocket, Socket};
 use tokio::{runtime, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
@@ -43,12 +43,7 @@ impl From<&zmq::Message> for Message {
         }
     }
 }
-fn start_pusher(
-    context: zmq::Context,
-    stop: CancellationToken,
-    endpoint: &str,
-) -> mpsc::Sender<Message> {
-}
+
 /// Handle movement of messages between input and output ZMQ streams
 async fn do_pump(
     mut enabled: Watcher<bool>,
@@ -68,8 +63,9 @@ async fn do_pump(
         }
     }
 
-    let sock_out = Socket::new(ctx.socket(zmq::SocketType::PUSH)?);
-    sock_out.bind(push_endpoint)?;
+    let socket_out = PushSocket::bind(&push_endpoint, ctx.clone(), stop.clone(), 500)
+        .await
+        .unwrap();
 
     println!("Pump starting");
     loop {
@@ -115,8 +111,7 @@ async fn do_pump(
                 // Equally, failing to pass on the message is also a fatal error
                 trace!("Forwarded {} byte message to output.", msg.len());
 
-                sock_out.send(msg, if get_more { zmq::SNDMORE } else { 0 }).unwrap();
-                // println!("Send to out socket\n");
+                socket_out.try_send(msg).unwrap();
             },
         }
     }
