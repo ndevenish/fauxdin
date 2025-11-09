@@ -2,7 +2,7 @@ use std::{
     panic,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -18,7 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use zmq::{Message, SocketType::PAIR};
+use zmq::Message;
 
 /// Wrapper for zmq PUSH socket sending data out of the program
 ///
@@ -263,7 +263,7 @@ impl PullSocket {
         Some(std::mem::take(&mut self.multipart_pending))
     }
 
-    pub async fn close(mut self) {
+    pub async fn close(self) {
         self.cancel.cancel();
         todo!();
         // self.recv_task.take().map(|v| v.join());

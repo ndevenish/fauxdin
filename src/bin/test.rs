@@ -1,6 +1,4 @@
-use std::{marker::PhantomData, rc::Rc, time::Duration};
 
-use fauxdin::zmq::PullSocket;
 
 #[tokio::main]
 async fn main() {
