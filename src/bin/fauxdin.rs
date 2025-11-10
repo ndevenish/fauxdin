@@ -22,13 +22,6 @@ async fn maybe_recv(t: &mut Option<PullSocket>) -> Option<Option<zmq::Message>> 
         }
     }
 }
-// /// Asynchronously call recv_multipart, if the argument is Some()
-// async fn maybe_recv_multipart(t: &mut Option<PullSocket>) -> Option<Option<Vec<zmq::Message>>> {
-//     match t {
-//         Some(socket) => Some(socket.recv_multipart().await),
-//         None => None,
-//     }
-// }
 
 /// Basic wrapper of message data (as [`zmq::Message`] is not Clone)
 struct Message {
@@ -177,11 +170,6 @@ impl PumpHandle {
         loop {
             match self.recv().await {
                 Some(msg) => {
-                    // println!(
-                    //     "Got message {} bytes, more: {:?}",
-                    //     msg.data.len(),
-                    //     msg.is_more
-                    // );
                     let is_more = msg.is_more;
                     self.multipart_pending.push(msg.data);
                     // Keep looping here until we have all the messages
