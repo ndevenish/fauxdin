@@ -3,7 +3,7 @@ use std::thread::JoinHandle;
 
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
-use fauxdin::zmq::{PullSocket, PushSocket, Socket};
+use fauxdin::zmq::{PullSocket, PushSocket};
 use tokio::{runtime, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
@@ -83,14 +83,14 @@ async fn do_pump(
                 } else if !enabled && let Some(socket) = sock_in.take() {
                     // Turning off. Close down the input port.
                     debug!("Message pump disabled. Closing down incoming ZMQ connection.");
-                    socket.close();
+                    socket.close().await;
                 }
             },
             Ok(_) = target_endpoint.changed() => {
                 // We have updated the target
                 let endpoint = target_endpoint.borrow_and_update().unwrap();
                 if let Some(sock_to_close) = sock_in.take() {
-                    sock_to_close.close();
+                    sock_to_close.close().await;
                 }
                 if endpoint.is_empty() {
                     info!("Connection endpoint cleared, suspending connection");
