@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::{
     runtime::Builder,
     select,
@@ -18,6 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
+use url::Url;
 use zmq::Message;
 
 /// Wrapper for zmq PUSH socket sending data out of the program
@@ -40,6 +41,8 @@ pub struct PushSocket {
     buffer_debt: AtomicUsize,
     /// The inner loop join handle
     inner_loop: Option<JoinHandle<()>>,
+    /// The bound port, if known. Will be None for non-tcp protocols.
+    port: Option<u16>,
 }
 impl PushSocket {
     /// Bind a zmq PUSH socket, given context and initial buffer length
@@ -49,6 +52,13 @@ impl PushSocket {
     /// can be buffered inside the [`PushSocket`]. This quantity can be
     /// adjusted at run-time without reopening the socket.
     ///
+    /// In addition to this buffer, the ZeroMQ socket itself will be set up
+    /// with a high water mark capacity of `zmq_send_hmw`, so the maximum
+    /// number of messages that can be buffered is `presocket_queue_length +
+    /// zmq_send_hwm`. Whereas normally in ZMQ a HWM of zero means "no limit",
+    /// here it will cause an error, because if you want an unlimited buffer
+    /// then this socket wrapper is unnecessary.
+    ///
     /// Awaiting will wait for the socket to be bound and the worker thread to
     /// be started.
     pub async fn bind(
@@ -56,6 +66,7 @@ impl PushSocket {
         context: zmq::Context,
         cancel_token: CancellationToken,
         presocket_queue_length: usize,
+        zmq_send_hwm: usize,
     ) -> Result<PushSocket> {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -73,13 +84,25 @@ impl PushSocket {
                     return;
                 }
             };
+            let Ok(snd_hwm) : Result<i32, _> = zmq_send_hwm.try_into() else {
+                let _ = launch_tx.send(Err(anyhow!("zmq_send_hwm {zmq_send_hwm} is too large (must be i32)")));
+                return;
+            };
+            sock_out.set_sndhwm(value)
             if let Err(e) = sock_out.bind(&inner_endpoint) {
                 let _ = launch_tx.send(Err(e));
                 return;
             }
+            let real_port = match sock_out.get_last_endpoint() {
+                Ok(Ok(endpoint)) => match Url::parse(&endpoint) {
+                    Ok(url) => url.port(),
+                    _ => None,
+                },
+                _ => None,
+            };
 
             rt.block_on(async move {
-                let _ = launch_tx.send(Ok(()));
+                let _ = launch_tx.send(Ok(real_port));
                 loop {
                     let msg: Message = select! {
                         _ = inner_cancel_token.cancelled() => {break;},
@@ -117,7 +140,7 @@ impl PushSocket {
             });
         });
         // Wait for the actual binding
-        launch_rx.await??;
+        let port = launch_rx.await??;
         Ok(PushSocket {
             cancel_token: CancellationToken::new(),
             tx,
@@ -125,6 +148,7 @@ impl PushSocket {
             buffer_size: presocket_queue_length,
             buffer_debt: 0.into(),
             inner_loop: Some(inner_loop),
+            port,
         })
     }
 
@@ -186,6 +210,9 @@ impl PushSocket {
     pub fn close(mut self) -> JoinHandle<()> {
         self.cancel_token.cancel();
         self.inner_loop.take().unwrap()
+    }
+    pub fn port(&self) -> Option<u16> {
+        self.port
     }
 }
 
@@ -318,4 +345,22 @@ fn inner_recv(
         }
     }
     println!("Inner receive: Ending");
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_util::sync::CancellationToken;
+
+    use crate::zmq::PushSocket;
+
+    use anyhow::Result;
+
+    #[tokio::test]
+    async fn test_push() -> Result<()> {
+        let context = zmq::Context::new();
+        let cancel = CancellationToken::new();
+        let sock_out = PushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10).await?;
+        println!("Bound to port: {:?}", sock_out.port());
+        Ok(())
+    }
 }
