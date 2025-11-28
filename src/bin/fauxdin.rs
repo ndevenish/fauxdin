@@ -56,7 +56,7 @@ async fn do_pump(
         }
     }
 
-    let socket_out = PushSocket::bind(&push_endpoint, ctx.clone(), stop.clone(), 500)
+    let socket_out = PushSocket::bind(&push_endpoint, ctx.clone(), stop.clone(), 500, 50)
         .await
         .unwrap();
 

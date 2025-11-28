@@ -80,17 +80,22 @@ impl PushSocket {
             let sock_out = match context.socket(zmq::SocketType::PUSH) {
                 Ok(sock) => sock,
                 Err(e) => {
-                    let _ = launch_tx.send(Err(e));
+                    let _ = launch_tx.send(Err(e.into()));
                     return;
                 }
             };
-            let Ok(snd_hwm) : Result<i32, _> = zmq_send_hwm.try_into() else {
-                let _ = launch_tx.send(Err(anyhow!("zmq_send_hwm {zmq_send_hwm} is too large (must be i32)")));
+            let Ok(snd_hwm): Result<i32, _> = zmq_send_hwm.try_into() else {
+                let _ = launch_tx.send(Err(anyhow!(
+                    "zmq_send_hwm {zmq_send_hwm} is too large (must be i32)"
+                )));
                 return;
             };
-            sock_out.set_sndhwm(value)
+            if let Err(e) = sock_out.set_sndhwm(snd_hwm) {
+                let _ = launch_tx.send(Err(e.into()));
+                return;
+            };
             if let Err(e) = sock_out.bind(&inner_endpoint) {
-                let _ = launch_tx.send(Err(e));
+                let _ = launch_tx.send(Err(e.into()));
                 return;
             }
             let real_port = match sock_out.get_last_endpoint() {
@@ -359,7 +364,8 @@ mod tests {
     async fn test_push() -> Result<()> {
         let context = zmq::Context::new();
         let cancel = CancellationToken::new();
-        let sock_out = PushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10).await?;
+        let sock_out =
+            PushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10, 50).await?;
         println!("Bound to port: {:?}", sock_out.port());
         Ok(())
     }
