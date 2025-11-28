@@ -75,7 +75,7 @@ impl PushSocket {
         let inner_cancel_token = cancel_token.clone();
         let inner_endpoint = endpoint.to_string();
         let inner_loop = tokio::task::spawn_blocking(move || {
-            let rt = Builder::new_current_thread().build().unwrap();
+            let rt = Builder::new_current_thread().enable_time().build().unwrap();
 
             let sock_out = match context.socket(zmq::SocketType::PUSH) {
                 Ok(sock) => sock,
@@ -147,7 +147,7 @@ impl PushSocket {
         // Wait for the actual binding
         let port = launch_rx.await??;
         Ok(PushSocket {
-            cancel_token: CancellationToken::new(),
+            cancel_token: cancel_token,
             tx,
             tx_permits: Arc::new(Semaphore::new(presocket_queue_length)),
             buffer_size: presocket_queue_length,
@@ -355,6 +355,7 @@ fn inner_recv(
 #[cfg(test)]
 mod tests {
     use tokio_util::sync::CancellationToken;
+    use tracing_subscriber::fmt::format;
 
     use crate::zmq::PushSocket;
 
@@ -365,8 +366,31 @@ mod tests {
         let context = zmq::Context::new();
         let cancel = CancellationToken::new();
         let sock_out =
-            PushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10, 50).await?;
+            PushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10, 1).await?;
         println!("Bound to port: {:?}", sock_out.port());
+
+        // Try to send enough messages to fill the buffer
+        sock_out.try_send("Test Message".as_bytes().into()).unwrap();
+        for n in 0u8..10 {
+            sock_out.try_send([n].as_slice().into()).unwrap();
+        }
+
+        // Connect a zeromq socket to this
+        let inctx = zmq::Context::new();
+        let sock_in = inctx.socket(zmq::SocketType::PULL).unwrap();
+        sock_in
+            .connect(&format!("tcp://127.0.0.1:{}", sock_out.port().unwrap()))
+            .unwrap();
+        // Basic in/out
+
+        assert_eq!(
+            sock_in.recv_bytes(0).unwrap(),
+            "Test Message".as_bytes(),
+            "Got test message out of connected socket"
+        );
+
+        // Cleanup
+        sock_out.close().await.unwrap();
         Ok(())
     }
 }
