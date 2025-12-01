@@ -16,7 +16,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use url::Url;
 use zmq::Message;
@@ -211,6 +211,21 @@ impl PushSocket {
             self.buffer_debt.store(debt, Ordering::Relaxed);
             self.buffer_size = new_length;
         }
+        self.buffer_size = new_length;
+    }
+
+    /// Get the instantaneous count of buffered messages
+    pub fn buffered_count(&self) -> usize {
+        let out = (self.buffer_size + self.buffer_debt.load(Ordering::Relaxed))
+            .saturating_sub(self.tx_permits.available_permits());
+        println!(
+            "Size: {} + debt {} - avail {} = {}",
+            self.buffer_size,
+            self.buffer_debt.load(Ordering::Relaxed),
+            self.tx_permits.available_permits(),
+            out
+        );
+        out
     }
 
     /// Close the socket and wait for it finish closing
@@ -356,6 +371,10 @@ fn inner_recv(
 
 #[cfg(test)]
 mod tests {
+
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt::format;
 
@@ -367,30 +386,52 @@ mod tests {
     async fn test_push() -> Result<()> {
         let context = zmq::Context::new();
         let cancel = CancellationToken::new();
-        let sock_out =
+        let mut sock_out =
             PushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10, 1).await?;
         println!("Bound to port: {:?}", sock_out.port());
 
         // Try to send enough messages to fill the buffer
-        sock_out.try_send("Test Message".as_bytes().into()).unwrap();
         for n in 0u8..10 {
-            sock_out.try_send([n].as_slice().into()).unwrap();
+            sock_out.try_send(format!("{n}").as_bytes().into()).unwrap();
         }
+        // One message will be picked up to be sent, so wait for this to happen
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        sock_out.try_send("11".as_bytes().into()).unwrap();
+        // We should now have a full queue, ensure that sending fails
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sock_out.buffered_count(), 10);
+        assert!(matches!(
+            sock_out.try_send("message".as_bytes().into()),
+            Err(mpsc::error::TrySendError::Full(_)),
+        ));
+        // Change the buffer size, make sure we can now send
+        sock_out.set_buffer_length(11);
+        assert_eq!(sock_out.buffered_count(), 10);
+        sock_out.try_send("message".as_bytes().into()).unwrap();
+        assert_eq!(sock_out.buffered_count(), 11);
 
         // Connect a zeromq socket to this
         let inctx = zmq::Context::new();
         let sock_in = inctx.socket(zmq::SocketType::PULL).unwrap();
+        sock_in.set_rcvhwm(1).unwrap();
         sock_in
             .connect(&format!("tcp://127.0.0.1:{}", sock_out.port().unwrap()))
             .unwrap();
-        // Basic in/out
-
+        // Get the first message
         assert_eq!(
             sock_in.recv_bytes(0).unwrap(),
-            "Test Message".as_bytes(),
+            "0".as_bytes(),
             "Got test message out of connected socket"
         );
-
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sock_out.buffered_count(), 10);
+        assert_eq!(sock_in.recv_bytes(0).unwrap(), "1".as_bytes(),);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sock_out.buffered_count(), 9);
+        // drop(sock_in);
+        // Now, check how our sender is doing
+        println!("Output buffer: {}", sock_out.buffered_count());
+        tokio::time::sleep(Duration::from_millis(10)).await;
         // Cleanup
         sock_out.close().await.unwrap();
         Ok(())
