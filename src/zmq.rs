@@ -55,9 +55,11 @@ impl PushSocket {
     /// In addition to this buffer, the ZeroMQ socket itself will be set up
     /// with a high water mark capacity of `zmq_send_hmw`, so the maximum
     /// number of messages that can be buffered is `presocket_queue_length +
-    /// zmq_send_hwm`. Whereas normally in ZMQ a HWM of zero means "no limit",
-    /// here it will cause an error, because if you want an unlimited buffer
-    /// then this socket wrapper is unnecessary.
+    /// zmq_send_hwm`, depending on whether the ZeroMQ socket is internally
+    /// buffering (it does not do this before being connected to, for
+    /// instance). Whereas normally in ZMQ a HWM of zero means "no limit", here
+    /// it will cause an error, because if you want an unlimited buffer then
+    /// this socket wrapper is unnecessary.
     ///
     /// Awaiting will wait for the socket to be bound and the worker thread to
     /// be started.
@@ -110,7 +112,7 @@ impl PushSocket {
                 let _ = launch_tx.send(Ok(real_port));
                 loop {
                     let msg: Message = select! {
-                        _ = inner_cancel_token.cancelled() => {break;},
+                        _ = inner_cancel_token.cancelled() => break,
                         maybe_msg = rx.recv() => match maybe_msg {
                             Some((msg, _)) => msg,
                             None => break,
