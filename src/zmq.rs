@@ -29,7 +29,7 @@ use zmq::Message;
 /// slowly). This allows us to guarantee a set amount of message buffering, and
 /// avoids issues where the initial images might get dropped because the PUSH
 /// socket doesn't start buffering until it's seen a client.
-pub struct PushSocket {
+pub struct BufferedPushSocket {
     cancel_token: CancellationToken,
     /// Queue for messages.
     tx: mpsc::UnboundedSender<(zmq::Message, OwnedSemaphorePermit)>,
@@ -44,7 +44,7 @@ pub struct PushSocket {
     /// The bound port, if known. Will be None for non-tcp protocols.
     port: Option<u16>,
 }
-impl PushSocket {
+impl BufferedPushSocket {
     /// Bind a zmq PUSH socket, given context and initial buffer length
     ///
     /// Regardless of ZeroMQ HWM settings or whether the socket is being
@@ -69,7 +69,7 @@ impl PushSocket {
         cancel_token: CancellationToken,
         presocket_queue_length: usize,
         zmq_send_hwm: usize,
-    ) -> Result<PushSocket> {
+    ) -> Result<BufferedPushSocket> {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let (launch_tx, launch_rx) = oneshot::channel();
@@ -148,7 +148,7 @@ impl PushSocket {
         });
         // Wait for the actual binding
         let port = launch_rx.await??;
-        Ok(PushSocket {
+        Ok(BufferedPushSocket {
             cancel_token: cancel_token,
             tx,
             tx_permits: Arc::new(Semaphore::new(presocket_queue_length)),
@@ -238,7 +238,7 @@ impl PushSocket {
     }
 }
 
-impl Drop for PushSocket {
+impl Drop for BufferedPushSocket {
     fn drop(&mut self) {
         self.cancel_token.cancel();
     }
@@ -378,7 +378,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt::format;
 
-    use crate::zmq::PushSocket;
+    use crate::zmq::BufferedPushSocket;
 
     use anyhow::Result;
 
@@ -387,7 +387,7 @@ mod tests {
         let context = zmq::Context::new();
         let cancel = CancellationToken::new();
         let mut sock_out =
-            PushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10, 1).await?;
+            BufferedPushSocket::bind("tcp://127.0.0.1:*", context, cancel.clone(), 10, 1).await?;
         println!("Bound to port: {:?}", sock_out.port());
 
         // Try to send enough messages to fill the buffer

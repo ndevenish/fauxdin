@@ -3,7 +3,7 @@ use std::thread::JoinHandle;
 
 use anyhow::Result;
 use epicars::{ServerBuilder, client::Watcher};
-use fauxdin::zmq::{PullSocket, PushSocket};
+use fauxdin::zmq::{BufferedPushSocket, PullSocket};
 use tokio::{runtime, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
@@ -56,7 +56,7 @@ async fn do_pump(
         }
     }
 
-    let socket_out = PushSocket::bind(push_endpoint, ctx.clone(), stop.clone(), 500, 50)
+    let socket_out = BufferedPushSocket::bind(push_endpoint, ctx.clone(), stop.clone(), 500, 50)
         .await
         .unwrap();
 
