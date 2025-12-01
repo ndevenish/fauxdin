@@ -72,17 +72,33 @@ def main():
     frames = 0
     expected_images = 0
     progress = None
+    series = None
     while True:
         messages = socket.recv_multipart()
 
         m0 = json.loads(messages[0].decode())
 
+        if "htype" not in m0 or "series" not in m0:
+            print("Warning: Got invalid first packet, did we start mid-stream?")
+
         htype = m0["htype"]
+
+        if series != m0["series"]:
+            # Ensure that we make the series dir, even if we start mid-stream
+            series = m0["series"]
+            Path(f"{series}").mkdir(exist_ok=True)
         series = m0["series"]
 
         if htype.startswith("dheader"):
+            # If we were in the middle of processing something and didn't finish
+            if progress is not None:
+                print(
+                    f"Warning: Early termination of series {series} with {frames} frames and without end packet"
+                )
+                progress.close()
+                progress = None
             t0 = time.time()
-            os.mkdir(f"{series}")
+            Path(f"{series}").mkdir(exist_ok=True)
             frames = 0
             process_headers(series, messages)
             # Manage progress indicator
@@ -94,11 +110,13 @@ def main():
         elif htype.startswith("dimage"):
             process_image(series, messages, m0["frame"])
             frames += 1
-            progress.update()
+            if progress:
+                progress.update()
         elif htype.startswith("dseries"):
             process_term(series, messages)
-            progress.close()
-            progress = None
+            if progress:
+                progress.close()
+                progress = None
             print(
                 f"Series {series} acquisition time: {time.time() - t0:.2f}s for {frames} images"
             )
