@@ -2,7 +2,7 @@ use std::{
     panic,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -32,7 +32,7 @@ use zmq::Message;
 pub struct BufferedPushSocket {
     cancel_token: CancellationToken,
     /// Queue for messages.
-    tx: mpsc::UnboundedSender<(zmq::Message, OwnedSemaphorePermit)>,
+    tx: mpsc::UnboundedSender<(zmq::Message, Option<OwnedSemaphorePermit>)>,
     tx_permits: Arc<Semaphore>,
     /// The total allowed enqueued messages. The actual number may be higher
     /// than this if it was resized while above the new capacity.
@@ -43,14 +43,21 @@ pub struct BufferedPushSocket {
     inner_loop: Option<JoinHandle<()>>,
     /// The bound port, if known. Will be None for non-tcp protocols.
     port: Option<u16>,
+    /// Whether the socket is in the middle of enqueueing a multipart message
+    mid_multipart_message: AtomicBool,
 }
 impl BufferedPushSocket {
     /// Bind a zmq PUSH socket, given context and initial buffer length
     ///
     /// Regardless of ZeroMQ HWM settings or whether the socket is being
-    /// actively drained by an external client, `presocket_queue_length` items
-    /// can be buffered inside the [`PushSocket`]. This quantity can be
-    /// adjusted at run-time without reopening the socket.
+    /// actively drained by an external client, a minimum
+    /// `presocket_queue_length` items can be buffered inside the
+    /// [`PushSocket`]. This quantity can be adjusted at run-time without
+    /// reopening the socket. The number of queued messages can exceed this
+    /// queue length in cases where multipart messages are being sent - this
+    /// socket will never fail to enqueue mid-multipart-messages, although they
+    /// may not be delievered if the client never recovers (or the socket is
+    /// closed).
     ///
     /// In addition to this buffer, the ZeroMQ socket itself will be set up
     /// with a high water mark capacity of `zmq_send_hmw`, so the maximum
@@ -156,6 +163,7 @@ impl BufferedPushSocket {
             buffer_debt: 0.into(),
             inner_loop: Some(inner_loop),
             port,
+            mid_multipart_message: false.into(),
         })
     }
 
@@ -173,10 +181,24 @@ impl BufferedPushSocket {
             self.buffer_debt
                 .fetch_sub(self.tx_permits.forget_permits(debt), Ordering::Relaxed);
         }
-        let Ok(permit) = self.tx_permits.clone().try_acquire_owned() else {
-            return Err(mpsc::error::TrySendError::Full(message));
+
+        // Try and get a spare permit to send... but if this is in the middle
+        // of a multipart message then allow us to enqueue it anyway.
+        let permit = match self.tx_permits.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                if !self.mid_multipart_message.load(Ordering::Acquire) {
+                    return Err(mpsc::error::TrySendError::Full(message));
+                }
+                println!("Got failure to enqueue, but are in middle of multipart; forcing queue");
+                None
+            }
         };
-        // We have a permit to send
+
+        // Update the "are we in the middle of a multipart" flag
+        self.mid_multipart_message
+            .store(message.get_more(), Ordering::Release);
+        // Now do the send
         if let Err(mpsc::error::SendError((message, _))) = self.tx.send((message, permit)) {
             // We failed to send, which means the channel was closed
             return Err(mpsc::error::TrySendError::Closed(message));
@@ -214,18 +236,14 @@ impl BufferedPushSocket {
         self.buffer_size = new_length;
     }
 
-    /// Get the instantaneous count of buffered messages
-    pub fn buffered_count(&self) -> usize {
-        let out = (self.buffer_size + self.buffer_debt.load(Ordering::Relaxed))
-            .saturating_sub(self.tx_permits.available_permits());
-        println!(
-            "Size: {} + debt {} - avail {} = {}",
-            self.buffer_size,
-            self.buffer_debt.load(Ordering::Relaxed),
-            self.tx_permits.available_permits(),
-            out
-        );
-        out
+    /// Get the (rough) instantaneous count of buffered messages. This will not
+    /// count forcible-enqueued multipart messages, so is <= the current state.
+    ///
+    /// Test-only, because it is hard to make this properly meaningful
+    #[cfg(test)]
+    fn buffered_count(&self) -> usize {
+        (self.buffer_size + self.buffer_debt.load(Ordering::Relaxed))
+            .saturating_sub(self.tx_permits.available_permits())
     }
 
     /// Close the socket and wait for it finish closing
@@ -376,7 +394,6 @@ mod tests {
 
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
-    use tracing_subscriber::fmt::format;
 
     use crate::zmq::BufferedPushSocket;
 
