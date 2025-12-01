@@ -6,20 +6,14 @@ use epicars::{ServerBuilder, client::Watcher};
 use fauxdin::zmq::{BufferedPushSocket, PullSocket};
 use tokio::{runtime, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Asynchronously call recv, if the argument is Some()
 async fn maybe_recv(t: &mut Option<PullSocket>) -> Option<Option<zmq::Message>> {
     match t {
-        Some(socket) => {
-            println!("maybe_recv waiting because socket has value");
-            Some(socket.recv().await)
-        }
-        None => {
-            println!("Maybe receive is None");
-            None
-        }
+        Some(socket) => Some(socket.recv().await),
+        None => None,
     }
 }
 
@@ -62,7 +56,6 @@ async fn do_pump(
 
     println!("Pump starting");
     loop {
-        println!("Pump loop");
         tokio::select! {
             _ = stop.cancelled() => break,
             Ok(_) = enabled.changed() => {
@@ -97,14 +90,22 @@ async fn do_pump(
                 // it fails, because otherwise we are just a message
                 // pump with no way to resume mirroring - meaning that
                 // we will eventually have to terminate anyway.
-                println!("Got message in fauxdin");
                 copy_to.send((&msg).into()).expect("Failed to mirror messages: Was it dropped without clean shutdown?");
-                println!("---- Sent onwards");
-                let get_more = msg.get_more();
-                // Equally, failing to pass on the message is also a fatal error
-                trace!("Forwarded {} byte message to output.", msg.len());
+                // println!("Got/forwarded message in fauxdin");
+                trace!("Forwarded {} byte message", msg.len());
 
-                socket_out.try_send(msg).unwrap();
+                // Try to send this message to the output socket. If this fails,
+                // then we may want to carry on anyway
+                match socket_out.try_send(msg) {
+                    Ok(()) => (),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Unfortunate, but what we are here to deal with
+                        warn!("Failed to forward message to PUSH, dropping");
+                    },
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        panic!("Internal output PUSH socket closed; did we fail to cleanly shutdown?");
+                    }
+                }
             },
         }
     }
@@ -174,10 +175,6 @@ impl PumpHandle {
                     self.multipart_pending.push(msg.data);
                     // Keep looping here until we have all the messages
                     if is_more {
-                        println!(
-                            "Got another multipart, part {}",
-                            self.multipart_pending.len()
-                        );
                         continue;
                     } else {
                         break;
