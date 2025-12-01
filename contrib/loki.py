@@ -18,6 +18,8 @@ import random
 from argparse import ArgumentParser
 from tqdm import tqdm
 from zmq.utils.monitor import recv_monitor_message
+import ast
+import json
 
 # we need a series ID for this but it does not really matter what it is
 # so long as it is actually constant for a given run
@@ -55,7 +57,8 @@ def make_send_header(socket, meta):
         part1 = (
             '{"header_detail":"all","htype":"dheader-1.0","series":%d}' % SERIES_ID
         ).encode()
-        part2 = f["config"][()]
+        # This is incorrectly written as python repr to the h5... convert it
+        part2 = json.dumps(ast.literal_eval(f["config"][()].decode())).encode()
 
         # flatfield
         flatfield = f["flatfield"][()]
