@@ -16,7 +16,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use url::Url;
 use zmq::Message;
@@ -149,7 +149,7 @@ impl BufferedPushSocket {
         // Wait for the actual binding
         let port = launch_rx.await??;
         Ok(BufferedPushSocket {
-            cancel_token: cancel_token,
+            cancel_token,
             tx,
             tx_permits: Arc::new(Semaphore::new(presocket_queue_length)),
             buffer_size: presocket_queue_length,
