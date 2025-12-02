@@ -58,21 +58,26 @@ async fn do_pump(
         .await
         .unwrap();
 
-    println!("Pump starting");
+    info!(
+        "Starting message pump from {} to {}",
+        target_endpoint
+            .borrow_and_update()
+            .unwrap_or("<ERROR>".to_string()),
+        push_endpoint
+    );
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
             Ok(_) = enabled.changed() => {
-                println!("Enabled changed");
                 let endpoint = target_endpoint.borrow_and_update()?;
                 let enabled = enabled.borrow_and_update()?;
                 if enabled && sock_in.is_none() {
                     // Turning on. Connect to target again
-                    debug!("Message pump enabled via PV. Connecting to {endpoint}");
+                    info!("Message pump enabled via PV. Connecting to {endpoint}");
                     sock_in = Some(PullSocket::connect(&endpoint, ctx.clone(), &mut subtasks)?);
                 } else if !enabled && let Some(socket) = sock_in.take() {
                     // Turning off. Close down the input port.
-                    debug!("Message pump disabled. Closing down incoming ZMQ connection.");
+                    info!("Message pump disabled. Closing down incoming ZMQ connection.");
                     socket.close().await;
                 }
             },
@@ -95,7 +100,6 @@ async fn do_pump(
                 // pump with no way to resume mirroring - meaning that
                 // we will eventually have to terminate anyway.
                 copy_to.send((&msg).into()).expect("Failed to mirror messages: Was it dropped without clean shutdown?");
-                // println!("Got/forwarded message in fauxdin");
                 trace!("Forwarded {} byte message", msg.len());
 
                 // Try to send this message to the output socket. If this fails,
@@ -113,7 +117,7 @@ async fn do_pump(
             },
         }
     }
-    println!("Pump ended");
+    info!("Closed message pump");
     Ok(())
 }
 
@@ -277,7 +281,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = enabled.changed() => {
-                println!("Enable signal changed");
+                debug!("Enable signal changed");
             },
             m = pump.recv_multipart() => match m {
                 Some(messages) => writer.write(messages),

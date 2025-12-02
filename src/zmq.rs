@@ -16,7 +16,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use url::Url;
 use zmq::Message;
@@ -191,7 +191,7 @@ impl BufferedPushSocket {
                 if !self.mid_multipart_message.load(Ordering::Acquire) {
                     return Err(mpsc::error::TrySendError::Full(message));
                 }
-                println!("Got failure to enqueue, but are in middle of multipart; forcing queue");
+                debug!("Got failure to enqueue, but are in middle of multipart; forcing queue");
                 None
             }
         };
@@ -284,7 +284,7 @@ impl PullSocket {
                 socket.set_rcvtimeo(100).unwrap();
                 socket.connect(&inner_endpoint).unwrap();
                 inner_recv(socket, inner_token, tx);
-                println!("Closing thread");
+                debug!("Closing pullsocket thread");
             })
             .join()
             .unwrap();
@@ -358,10 +358,6 @@ fn inner_recv(
     let mut num = 0usize;
     let mut num_fin = 0usize;
     while !token.is_cancelled() {
-        // println!("Inner receive: Loop start");
-        // print!("  inner_recv {}\r", spinner.next().unwrap());
-        // let _ = std::io::stdout().flush();
-
         let mut msg = zmq::Message::new();
         match socket.recv(&mut msg, 0) {
             Ok(_) => {
@@ -376,7 +372,6 @@ fn inner_recv(
                 print!(" Inner receive: Got message {} ({} final)\r", num, num_fin);
             }
             Err(zmq::Error::EAGAIN) => {
-                // println!("Inner receive: Waiting for ZMQ, got EAGAIN");
                 continue;
             }
             Err(e) => {
@@ -385,7 +380,7 @@ fn inner_recv(
             }
         }
     }
-    println!("Inner receive: Ending");
+    trace!("Inner receive: Ending");
 }
 
 #[cfg(test)]
