@@ -2,6 +2,7 @@ use core::panic;
 use std::thread::JoinHandle;
 
 use anyhow::Result;
+use clap::Parser;
 use epicars::{ServerBuilder, client::Watcher};
 use fauxdin::zmq::{BufferedPushSocket, PullSocket};
 use tokio::{runtime, sync::mpsc, task::JoinSet};
@@ -193,19 +194,42 @@ impl PumpHandle {
     }
 }
 
+/// Act as a passthrough for streamed detector data, optionally
+/// intercepting and mirroring the data stream.
+#[derive(Parser, Debug)]
+struct Args {
+    /// Where to stream intercepted values to. Currently, only accepts a folder target.
+    #[arg(default_value = "./dump")]
+    output: String,
+    /// Show debug output by default
+    #[arg(short, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+impl Args {
+    /// Return the user verbosity setting as a string
+    fn verbosity(&self) -> &str {
+        match self.verbose {
+            0 => "info",
+            1 => "debug",
+            2.. => "trace",
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::default()
             .add_directive("warn".parse().unwrap())
             .add_directive(
-                format!("{}=debug", env!("CARGO_CRATE_NAME"))
+                format!("{}={}", env!("CARGO_CRATE_NAME"), args.verbosity())
                     .parse()
                     .unwrap(),
             )
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    // console_subscriber::init();
 
     let mut library = epicars::providers::IntercomProvider::new();
     let target: Watcher<String> = library
