@@ -7,7 +7,10 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use epicars::{ServerBuilder, client::Watcher};
-use fauxdin::zmq::{BufferedPushSocket, PullSocket};
+use fauxdin::{
+    writers::FolderWriter,
+    zmq::{BufferedPushSocket, PullSocket},
+};
 use tokio::{runtime, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
@@ -223,37 +226,13 @@ impl Args {
     }
 }
 
-/// Writes a copy of a stream of data to a folder.
-///
-/// Matches behaviour of ODIN /dev/shm writer
-struct FolderWriter {
-    /// The base folder location to write to
-    base: PathBuf,
-}
-
-impl FolderWriter {
-    fn new(output_path: &Path) -> Self {
-        FolderWriter {
-            base: output_path.to_path_buf(),
-        }
-    }
-    fn write(&self, messages: Vec<Vec<u8>>) {
-        debug!(
-            "Received: {} messages, sizes: [{}]",
-            messages.len(),
-            messages
-                .iter()
-                .map(|m| m.len().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Handle setting up default logging:
+    // - This crate should be whatever is specified by the verbosity argument (default "info")
+    // - All other crates should be "warn"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::default()
             .add_directive("warn".parse().unwrap())
@@ -273,6 +252,7 @@ async fn main() -> Result<()> {
         .unwrap()
         .watch();
     let mut enabled = library.add_pv("FAUXDIN:ENABLED", true).unwrap().watch();
+    let mut mirror = library.add_pv("FAUXDIN:MIRROR", true).unwrap().watch();
 
     let _server = ServerBuilder::new(library).start().await.unwrap();
     let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9998");
@@ -283,8 +263,14 @@ async fn main() -> Result<()> {
             _ = enabled.changed() => {
                 debug!("Enable signal changed");
             },
+            _ = mirror.changed() => {
+                debug!("Mirroring toggled");
+                writer.toggle(mirror.borrow().unwrap_or_default());
+            }
             m = pump.recv_multipart() => match m {
-                Some(messages) => writer.write(messages),
+                Some(messages) => if mirror.borrow().unwrap_or_default() {
+                    writer.write(messages);
+                },
                 None => {
                     error!("Internal receiver terminated prematurely");
                     break;
