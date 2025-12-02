@@ -1,5 +1,8 @@
 use core::panic;
-use std::thread::JoinHandle;
+use std::{
+    path::{Path, PathBuf},
+    thread::JoinHandle,
+};
 
 use anyhow::Result;
 use clap::Parser;
@@ -216,6 +219,33 @@ impl Args {
     }
 }
 
+/// Writes a copy of a stream of data to a folder.
+///
+/// Matches behaviour of ODIN /dev/shm writer
+struct FolderWriter {
+    /// The base folder location to write to
+    base: PathBuf,
+}
+
+impl FolderWriter {
+    fn new(output_path: &Path) -> Self {
+        FolderWriter {
+            base: output_path.to_path_buf(),
+        }
+    }
+    fn write(&self, messages: Vec<Vec<u8>>) {
+        debug!(
+            "Received: {} messages, sizes: [{}]",
+            messages.len(),
+            messages
+                .iter()
+                .map(|m| m.len().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -242,13 +272,15 @@ async fn main() -> Result<()> {
 
     let _server = ServerBuilder::new(library).start().await.unwrap();
     let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9998");
+    info!("Writing data stream out to: {}", args.output);
+    let writer = FolderWriter::new(Path::new(&args.output));
     loop {
         tokio::select! {
             _ = enabled.changed() => {
                 println!("Enable signal changed");
             },
             m = pump.recv_multipart() => match m {
-                Some(messages) => println!("Received: {} messages, sizes: [{}]", messages.len(),  messages.iter().map(|m| m.len().to_string()).collect::<Vec<_>>().join(", ")),
+                Some(messages) => writer.write(messages),
                 None => {
                     error!("Internal receiver terminated prematurely");
                     break;
