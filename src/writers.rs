@@ -38,8 +38,8 @@ impl DetectorHeader {
 
 pub trait AcquisitionWriter {
     fn handle_start(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> Result<()>;
-    fn handle_end(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> io::Result<()>;
     fn handle_image(&self, series: usize, image: usize, messages: &Vec<Vec<u8>>) -> io::Result<()>;
+    fn handle_end(&mut self, series: usize) -> io::Result<()>;
 }
 
 /// Writes a copy of a stream of data to a folder.
@@ -82,13 +82,12 @@ impl AcquisitionWriter for FolderWriter {
         self.current_path = Some(series_path);
         Ok(())
     }
-    fn handle_end(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> io::Result<()> {
+    fn handle_end(&mut self, series: usize) -> io::Result<()> {
         info!("Ending acquisition {series}");
 
-        assert!(messages.len() == 1);
         fs::write(
             self.current_path.as_ref().unwrap().join("end"),
-            messages.first().expect("Got empty end messages!!"),
+            format!(r#"{{"htype":"dseries_end-1.0","series":{series}}}"#).as_bytes(),
         )?;
         self.current_path = None;
         Ok(())
@@ -169,7 +168,7 @@ impl AcquisitionLifecycle {
             }
             (AcquisitionState::InAcquisition(s), DetectorHeader::SeriesEnd { .. }) => {
                 // Normal ending of an image series
-                self.writer.handle_end(*s, messages)?;
+                self.writer.handle_end(*s)?;
                 Ok(AcquisitionState::Waiting)
             }
             (AcquisitionState::InAcquisition(old_s), DetectorHeader::Header { series, .. }) => {
@@ -177,7 +176,7 @@ impl AcquisitionLifecycle {
                 // the end packet was lost, so we should warn but continue with
                 // the new acquisition.
                 warn!("Header for new series {series} recieved before end packet for {old_s}");
-                self.writer.handle_end(*old_s, messages)?;
+                self.writer.handle_end(*old_s)?;
                 self.writer.handle_start(*series, messages)?;
                 Ok(AcquisitionState::InAcquisition(*series))
             }
