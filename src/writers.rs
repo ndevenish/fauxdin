@@ -35,36 +35,32 @@ impl DetectorHeader {
         }
     }
 }
+
+pub trait AcquisitionWriter {
+    fn handle_start(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> Result<()>;
+    fn handle_end(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> io::Result<()>;
+    fn handle_image(&self, series: usize, image: usize, messages: &Vec<Vec<u8>>) -> io::Result<()>;
+}
+
 /// Writes a copy of a stream of data to a folder.
 ///
 /// Matches behaviour of ODIN /dev/shm writer
 pub struct FolderWriter {
     /// The base folder location to write to
     base: PathBuf,
-    state: FolderWriterState,
     /// The current series-destination path
     current_path: Option<PathBuf>,
 }
 
-/// Keep track of the current writer state
-#[derive(Copy, Clone)]
-enum FolderWriterState {
-    /// Waiting for the header packet of a new capture series
-    Waiting,
-    /// Currently processing a specific series
-    InAcquisition(usize),
-    /// We are currently skipping anything matching a specific series
-    Skipping(usize),
-}
-
 impl FolderWriter {
-    pub fn new(output_path: &Path) -> Self {
-        FolderWriter {
-            base: output_path.to_path_buf(),
-            state: FolderWriterState::Waiting,
+    pub fn new(base_path: &Path) -> Self {
+        Self {
+            base: base_path.to_path_buf(),
             current_path: None,
         }
     }
+}
+impl AcquisitionWriter for FolderWriter {
     fn handle_start(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> Result<()> {
         let mut attempts = 0usize;
         let mut series_path = self.base.join(format!("{series}"));
@@ -113,66 +109,91 @@ impl FolderWriter {
         }
         Ok(())
     }
+}
+
+/// Keep track of the current writer state
+#[derive(Copy, Clone)]
+enum AcquisitionState {
+    /// Waiting for the header packet of a new capture series
+    Waiting,
+    /// Currently processing a specific series
+    InAcquisition(usize),
+    /// We are currently skipping anything matching a specific series
+    Skipping(usize),
+}
+
+pub struct AcquisitionLifecycle {
+    state: AcquisitionState,
+    writer: Box<dyn AcquisitionWriter>,
+}
+
+impl AcquisitionLifecycle {
+    pub fn new(writer: Box<dyn AcquisitionWriter>) -> Self {
+        Self {
+            state: AcquisitionState::Waiting,
+            writer,
+        }
+    }
 
     fn handle_messages(
         &mut self,
         header: &DetectorHeader,
         messages: &Vec<Vec<u8>>,
-    ) -> Result<FolderWriterState> {
+    ) -> Result<AcquisitionState> {
         match (&self.state, header) {
-            (FolderWriterState::Waiting, DetectorHeader::Header { series, .. }) => {
+            (AcquisitionState::Waiting, DetectorHeader::Header { series, .. }) => {
                 // We are starting a new acquisition!
-                self.handle_start(*series, messages)?;
-                Ok(FolderWriterState::InAcquisition(*series))
+                self.writer.handle_start(*series, messages)?;
+                Ok(AcquisitionState::InAcquisition(*series))
             }
-            (FolderWriterState::Waiting, _) => {
+            (AcquisitionState::Waiting, _) => {
                 // We got something other than a start header while waiting. Ignore this series.
                 warn!(
                     "Waiting for new collection, got a {header:?} message instead. Skipping series."
                 );
-                Ok(FolderWriterState::Skipping(header.series()))
+                Ok(AcquisitionState::Skipping(header.series()))
             }
-            (FolderWriterState::InAcquisition(s), DetectorHeader::Image { series, .. })
+            (AcquisitionState::InAcquisition(s), DetectorHeader::Image { series, .. })
                 if s != series =>
             {
                 // Normal image packet receipt, except the series changed!?!?
                 error!(
                     "Detector stream switched series from {s} to {series} without start or end packets! Skipping rest of series."
                 );
-                Ok(FolderWriterState::Skipping(*series))
+                Ok(AcquisitionState::Skipping(*series))
             }
-            (FolderWriterState::InAcquisition(s), DetectorHeader::Image { frame, .. }) => {
+            (AcquisitionState::InAcquisition(s), DetectorHeader::Image { frame, .. }) => {
                 // Normal receipt of an image packet
-                self.handle_image(*s, *frame, messages);
-                Ok(FolderWriterState::InAcquisition(*s))
+                self.writer.handle_image(*s, *frame, messages)?;
+                Ok(AcquisitionState::InAcquisition(*s))
             }
-            (FolderWriterState::InAcquisition(s), DetectorHeader::SeriesEnd { .. }) => {
+            (AcquisitionState::InAcquisition(s), DetectorHeader::SeriesEnd { .. }) => {
                 // Normal ending of an image series
-                self.handle_end(*s, messages);
-                Ok(FolderWriterState::Waiting)
+                self.writer.handle_end(*s, messages)?;
+                Ok(AcquisitionState::Waiting)
             }
-            (FolderWriterState::InAcquisition(old_s), DetectorHeader::Header { series, .. }) => {
+            (AcquisitionState::InAcquisition(old_s), DetectorHeader::Header { series, .. }) => {
                 // "Premature" end of an acquisition. This could indicate that
                 // the end packet was lost, so we should warn but continue with
                 // the new acquisition.
                 warn!("Header for new series {series} recieved before end packet for {old_s}");
-                self.handle_end(*old_s, messages);
-                self.handle_start(*series, messages)?;
-                Ok(FolderWriterState::InAcquisition(*series))
+                self.writer.handle_end(*old_s, messages)?;
+                self.writer.handle_start(*series, messages)?;
+                Ok(AcquisitionState::InAcquisition(*series))
             }
-            (FolderWriterState::Skipping(_), DetectorHeader::Header { series, .. }) => {
+            (AcquisitionState::Skipping(_), DetectorHeader::Header { series, .. }) => {
                 // We were ignoring a collection, now we have a new one
-                self.handle_start(*series, messages);
-                Ok(FolderWriterState::InAcquisition(*series))
+                self.writer.handle_start(*series, messages)?;
+                Ok(AcquisitionState::InAcquisition(*series))
             }
-            (FolderWriterState::Skipping(series), _) => {
+            (AcquisitionState::Skipping(series), _) => {
                 // Anything else except the new header we keep skipping
-                Ok(FolderWriterState::Skipping(*series))
+                Ok(AcquisitionState::Skipping(*series))
             }
         }
     }
 
-    pub fn write(&mut self, messages: Vec<Vec<u8>>) -> Result<()> {
+    pub fn handle(&mut self, messages: Vec<Vec<u8>>) -> Result<()> {
         debug!(
             "Received: {} messages, sizes: [{}]",
             messages.len(),
