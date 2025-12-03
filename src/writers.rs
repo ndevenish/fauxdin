@@ -3,10 +3,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use minio::s3::{self, creds::StaticProvider, http::BaseUrl, types::S3Api};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use url::Url;
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "htype")]
@@ -102,6 +104,45 @@ impl AcquisitionWriter for FolderWriter {
             fs::write(image_path, &message)?;
         }
         Ok(())
+    }
+}
+
+pub struct S3Writer {
+    client: minio::s3::Client,
+}
+impl S3Writer {
+    pub async fn new(endpoint: &str) -> Result<Self> {
+        let url = Url::parse(endpoint)?;
+
+        // Get the host contact details
+        let host = url.host().unwrap();
+        let port = url
+            .port_or_known_default()
+            .ok_or(anyhow!("Have not specified port"))?;
+        let server: BaseUrl = format!("http://{host}:{port}").parse()?;
+        let provider = StaticProvider::new("RdMnqpv5T3Ya10iVDsyh", "glxtesttest", None);
+
+        // Work out the bucket name from the url path
+        let client = s3::Client::new(server, Some(Box::new(provider)), None, None)?;
+        let bucket = url.path_segments().unwrap().next().unwrap();
+        if !client.bucket_exists(bucket).send().await?.exists {
+            return Err(anyhow!("Bucket {bucket} does not exist!"));
+        }
+
+        Ok(Self { client })
+    }
+}
+impl AcquisitionWriter for S3Writer {
+    fn handle_start(&mut self, series: usize, messages: Vec<Vec<u8>>) -> Result<()> {
+        todo!()
+    }
+
+    fn handle_end(&mut self, series: usize) -> io::Result<()> {
+        todo!()
+    }
+
+    fn handle_image(&self, series: usize, image: usize, messages: Vec<Vec<u8>>) -> io::Result<()> {
+        todo!()
     }
 }
 

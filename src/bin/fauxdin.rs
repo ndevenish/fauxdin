@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::Parser;
 use epicars::{ServerBuilder, client::Watcher};
 use fauxdin::{
-    writers::{AcquisitionLifecycle, FolderWriter},
+    writers::{AcquisitionLifecycle, FolderWriter, S3Writer},
     zmq::{BufferedPushSocket, PullSocket},
 };
 use tokio::{runtime, sync::mpsc, task::JoinSet};
@@ -257,8 +257,12 @@ async fn main() -> Result<()> {
     let _server = ServerBuilder::new(library).start().await.unwrap();
     let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9998");
     info!("Writing data stream out to: {}", args.output);
-    let writer = FolderWriter::new(Path::new(&args.output));
-    let mut lifecycle = AcquisitionLifecycle::new(Box::new(writer));
+    let mut lifecycle = if args.output.starts_with("s3://") {
+        AcquisitionLifecycle::new(Box::new(S3Writer::new(&args.output).await.unwrap()))
+    } else {
+        // Assume it's a folder writer
+        AcquisitionLifecycle::new(Box::new(FolderWriter::new(Path::new(&args.output))))
+    };
     loop {
         tokio::select! {
             _ = enabled.changed() => {
