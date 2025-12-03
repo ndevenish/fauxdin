@@ -214,6 +214,8 @@ struct Args {
     /// Show debug output by default
     #[arg(short, action = clap::ArgAction::Count)]
     verbose: u8,
+    #[arg(long, env = "FAUXDIN_CREDENTIALS")]
+    credentials: Option<PathBuf>,
 }
 impl Args {
     /// Return the user verbosity setting as a string
@@ -258,7 +260,14 @@ async fn main() -> Result<()> {
     let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9998");
     info!("Writing data stream out to: {}", args.output);
     let mut lifecycle = if args.output.starts_with("s3://") {
-        AcquisitionLifecycle::new(Box::new(S3Writer::new(&args.output).await.unwrap()))
+        // let Some(credentials) = args.credentials else {
+        //     error!("Please specify credentials file with --credentials or set FAUXDIN_CREDENTIALS to use s3")
+        // }
+        AcquisitionLifecycle::new(Box::new(
+            S3Writer::new(&args.output, args.credentials.as_deref())
+                .await
+                .unwrap(),
+        ))
     } else {
         // Assume it's a folder writer
         AcquisitionLifecycle::new(Box::new(FolderWriter::new(Path::new(&args.output))))

@@ -3,11 +3,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use minio::s3::{self, creds::StaticProvider, http::BaseUrl, types::S3Api};
+use minio::s3::{
+    self,
+    creds::StaticProvider,
+    http::BaseUrl,
+    types::{S3Api, ToStream},
+};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 use anyhow::{Result, anyhow};
+use tracing_subscriber::field::debug;
 use url::Url;
 
 #[derive(Deserialize, Debug)]
@@ -107,11 +113,51 @@ impl AcquisitionWriter for FolderWriter {
     }
 }
 
+#[derive(Deserialize)]
+struct Credentials {
+    access_key: String,
+    secret_key: String,
+}
 pub struct S3Writer {
     client: minio::s3::Client,
+    bucket: String,
+    bucket_path: Option<String>,
 }
+
+/// Given an absolute URL path (starting with '/'), work out the bucket and bucket path
+///
+/// The bucket is the first item in the path. The subpath within the bucket is
+/// any remaining path.
+fn get_bucket_and_path(path: &str) -> Option<(String, Option<String>)> {
+    let stripped = path.strip_prefix("/")?;
+
+    match stripped.split_once("/") {
+        None => {
+            if stripped.is_empty() {
+                None
+            } else {
+                Some((stripped.to_string(), None))
+            }
+        }
+        Some((prefix, suffix)) => {
+            if prefix.is_empty() {
+                None
+            } else {
+                Some((
+                    prefix.to_string(),
+                    if suffix.is_empty() {
+                        None
+                    } else {
+                        Some(suffix.to_string())
+                    },
+                ))
+            }
+        }
+    }
+}
+
 impl S3Writer {
-    pub async fn new(endpoint: &str) -> Result<Self> {
+    pub async fn new(endpoint: &str, credentials: Option<&Path>) -> Result<Self> {
         let url = Url::parse(endpoint)?;
 
         // Get the host contact details
@@ -120,18 +166,36 @@ impl S3Writer {
             .port_or_known_default()
             .ok_or(anyhow!("Have not specified port"))?;
         let server: BaseUrl = format!("http://{host}:{port}").parse()?;
-        let provider = StaticProvider::new("RdMnqpv5T3Ya10iVDsyh", "glxtesttest", None);
+
+        // Work out credentials
+        let provider = if let Some(path) = credentials {
+            let creds: Credentials = toml::from_slice(&fs::read(path)?)?;
+            StaticProvider::new(&creds.access_key, &creds.secret_key, None)
+        } else {
+            warn!("No credentials specified, falling back to anonymous access");
+            StaticProvider::new("", "", None)
+        };
 
         // Work out the bucket name from the url path
+        let Some((bucket, bucket_path)) = get_bucket_and_path(url.path()) else {
+            return Err(anyhow!(
+                "Unspecified or invalid bucket specified in {url}. Please pass s3://server:port/bucket"
+            ));
+        };
         let client = s3::Client::new(server, Some(Box::new(provider)), None, None)?;
-        let bucket = url.path_segments().unwrap().next().unwrap();
-        if !client.bucket_exists(bucket).send().await?.exists {
+
+        if !client.bucket_exists(&bucket).send().await?.exists {
             return Err(anyhow!("Bucket {bucket} does not exist!"));
         }
-
-        Ok(Self { client })
+        debug!("Successfully connected to {url} and confirmed bucket exists");
+        Ok(Self {
+            client,
+            bucket,
+            bucket_path,
+        })
     }
 }
+
 impl AcquisitionWriter for S3Writer {
     fn handle_start(&mut self, series: usize, messages: Vec<Vec<u8>>) -> Result<()> {
         todo!()

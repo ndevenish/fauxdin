@@ -7,7 +7,7 @@ edition = "2024"
 tokio = { version = "1.45.1", features = ["full", "sync"] }
 epicars = { path = "./epicars" }
 anyhow = "1.0.100"
-clap = { version = "4.5.50", features = ["derive"] }
+clap = { version = "4.5.50", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing = "0.1.41"
 #rzmq = "0.5.4"
@@ -19,3 +19,4 @@ thread-id = "5.0.0"
 url = "2.5.7"
 serde_json = "1.0.145"
 minio = "0.3.0"
+toml = "0.9.8"
