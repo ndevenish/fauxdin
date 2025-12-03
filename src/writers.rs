@@ -37,9 +37,9 @@ impl DetectorHeader {
 }
 
 pub trait AcquisitionWriter {
-    fn handle_start(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> Result<()>;
-    fn handle_image(&self, series: usize, image: usize, messages: &Vec<Vec<u8>>) -> io::Result<()>;
+    fn handle_start(&mut self, series: usize, messages: Vec<Vec<u8>>) -> Result<()>;
     fn handle_end(&mut self, series: usize) -> io::Result<()>;
+    fn handle_image(&self, series: usize, image: usize, messages: Vec<Vec<u8>>) -> io::Result<()>;
 }
 
 /// Writes a copy of a stream of data to a folder.
@@ -61,7 +61,7 @@ impl FolderWriter {
     }
 }
 impl AcquisitionWriter for FolderWriter {
-    fn handle_start(&mut self, series: usize, messages: &Vec<Vec<u8>>) -> Result<()> {
+    fn handle_start(&mut self, series: usize, messages: Vec<Vec<u8>>) -> Result<()> {
         let mut attempts = 0usize;
         let mut series_path = self.base.join(format!("{series}"));
         // This should rarely happen, but handle cases where this path already exists
@@ -92,12 +92,7 @@ impl AcquisitionWriter for FolderWriter {
         self.current_path = None;
         Ok(())
     }
-    fn handle_image(
-        &self,
-        _series: usize,
-        image: usize,
-        messages: &Vec<Vec<u8>>,
-    ) -> io::Result<()> {
+    fn handle_image(&self, _series: usize, image: usize, messages: Vec<Vec<u8>>) -> io::Result<()> {
         for (i, message) in messages.iter().enumerate() {
             let image_path = self
                 .current_path
@@ -137,7 +132,7 @@ impl AcquisitionLifecycle {
     fn handle_messages(
         &mut self,
         header: &DetectorHeader,
-        messages: &Vec<Vec<u8>>,
+        messages: Vec<Vec<u8>>,
     ) -> Result<AcquisitionState> {
         match (&self.state, header) {
             (AcquisitionState::Waiting, DetectorHeader::Header { series, .. }) => {
@@ -206,7 +201,7 @@ impl AcquisitionLifecycle {
         let header_0: DetectorHeader =
             serde_json::from_slice(&messages.first().expect("Got empty message set in Writer"))?;
 
-        self.state = match self.handle_messages(&header_0, &messages) {
+        self.state = match self.handle_messages(&header_0, messages) {
             Ok(state) => state,
             Err(e) => {
                 error!("Failed to handle message headed by {header_0:?}: {e}");
