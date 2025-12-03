@@ -7,9 +7,11 @@ use minio::s3::{
     self,
     creds::StaticProvider,
     http::BaseUrl,
+    segmented_bytes::SegmentedBytes,
     types::{S3Api, ToStream},
 };
 use serde::Deserialize;
+use tokio_util::bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
 use anyhow::{Result, anyhow};
@@ -121,7 +123,8 @@ struct Credentials {
 pub struct S3Writer {
     client: minio::s3::Client,
     bucket: String,
-    bucket_path: Option<String>,
+    /// Bucket sub-path, if present. Guaranteed to not end with '/'
+    bucket_path: String,
 }
 
 /// Given an absolute URL path (starting with '/'), work out the bucket and bucket path
@@ -191,22 +194,60 @@ impl S3Writer {
         Ok(Self {
             client,
             bucket,
-            bucket_path,
+            bucket_path: bucket_path
+                .map(|s| s.strip_suffix("/").unwrap_or(&s).to_string())
+                .unwrap_or(String::new()),
         })
+    }
+    fn upload_file(&self, path: &str, data: Vec<u8>) {
+        let client = self.client.clone();
+        let path = path.to_string();
+        let bucket = self.bucket.clone();
+
+        tokio::task::spawn(async move {
+            match client
+                .put_object(bucket, &path, SegmentedBytes::from(Bytes::from(data)))
+                .send()
+                .await
+            {
+                Ok(_) => info!("Successfully uploaded {path}"),
+                Err(e) => warn!("Failed to asynchronously upload data to {path}: {e}"),
+            }
+        });
     }
 }
 
 impl AcquisitionWriter for S3Writer {
     fn handle_start(&mut self, series: usize, messages: Vec<Vec<u8>>) -> Result<()> {
-        todo!()
+        let path = format!("{}/{}", self.bucket_path, series);
+        info!("Writing new acquisition {series} to {}", path);
+        for (i, message) in messages.into_iter().enumerate() {
+            self.upload_file(&format!("{path}/start_{i}"), message);
+        }
+        Ok(())
     }
 
     fn handle_end(&mut self, series: usize) -> io::Result<()> {
-        todo!()
+        //     fs::write(
+        //     self.current_path.as_ref().unwrap().join("end"),
+        //     format!(r#"{{"htype":"dseries_end-1.0","series":{series}}}"#).as_bytes(),
+        // )?;
+        self.upload_file(
+            &format!("{}/{series}/end", self.bucket_path),
+            format!(r#"{{"htype":"dseries_end-1.0","series":{series}}}"#)
+                .as_bytes()
+                .to_vec(),
+        );
+        Ok(())
     }
 
     fn handle_image(&self, series: usize, image: usize, messages: Vec<Vec<u8>>) -> io::Result<()> {
-        todo!()
+        let prefix = format!("{}/{}/image_{image:05}", self.bucket_path, series);
+        // info!("Writing new acquisition {series} to {}", path);
+        for (i, message) in messages.into_iter().enumerate() {
+            self.upload_file(&format!("{prefix}_{i}"), message);
+        }
+        Ok(())
     }
 }
 
