@@ -209,7 +209,7 @@ impl PumpHandle {
 #[derive(Parser, Debug)]
 struct Args {
     /// Where to stream intercepted values to. Currently, only accepts a folder target.
-    #[arg(default_value = "./dump")]
+    #[arg(default_value = "./dumps/streamcopy")]
     output: String,
     /// Show debug output by default
     #[arg(short, action = clap::ArgAction::Count)]
@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
     let _server = ServerBuilder::new(library).start().await.unwrap();
     let mut pump = PumpHandle::start(enabled.clone(), target, "tcp://0.0.0.0:9998");
     info!("Writing data stream out to: {}", args.output);
-    let writer = FolderWriter::new(Path::new(&args.output));
+    let mut writer = FolderWriter::new(Path::new(&args.output));
     loop {
         tokio::select! {
             _ = enabled.changed() => {

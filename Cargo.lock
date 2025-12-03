@@ -415,6 +415,7 @@ dependencies = [
  "console-subscriber",
  "epicars",
  "serde",
+ "serde_json",
  "thread-id",
  "tokio",
  "tokio-util",
