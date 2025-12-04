@@ -1,6 +1,10 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use minio::s3::{
@@ -125,6 +129,7 @@ pub struct S3Writer {
     bucket: String,
     /// Bucket sub-path, if present. Guaranteed to not end with '/'
     bucket_path: String,
+    uploads: Arc<AtomicUsize>,
 }
 
 /// Given an absolute URL path (starting with '/'), work out the bucket and bucket path
@@ -197,6 +202,7 @@ impl S3Writer {
             bucket_path: bucket_path
                 .map(|s| s.strip_suffix("/").unwrap_or(&s).to_string())
                 .unwrap_or(String::new()),
+            uploads: Default::default(),
         })
     }
     fn upload_file(&self, path: &str, data: Vec<u8>) {
@@ -204,7 +210,9 @@ impl S3Writer {
         let path = path.to_string();
         let bucket = self.bucket.clone();
 
+        let uploads = self.uploads.clone();
         tokio::task::spawn(async move {
+            uploads.fetch_add(1, Ordering::Relaxed);
             match client
                 .put_object(bucket, &path, SegmentedBytes::from(Bytes::from(data)))
                 .send()
@@ -213,6 +221,8 @@ impl S3Writer {
                 Ok(_) => info!("Successfully uploaded {path}"),
                 Err(e) => warn!("Failed to asynchronously upload data to {path}: {e}"),
             }
+            println!("In-flight on end: {}", uploads.load(Ordering::Relaxed));
+            uploads.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -220,7 +230,7 @@ impl S3Writer {
 impl AcquisitionWriter for S3Writer {
     fn handle_start(&mut self, series: usize, messages: Vec<Vec<u8>>) -> Result<()> {
         let path = format!("{}/{}", self.bucket_path, series);
-        info!("Writing new acquisition {series} to {}", path);
+        info!("Writing new acquisition {series} to {}", path,);
         for (i, message) in messages.into_iter().enumerate() {
             self.upload_file(&format!("{path}/start_{i}"), message);
         }
