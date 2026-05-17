@@ -29,8 +29,6 @@ pub struct PushSinkConfig {
     pub endpoint: String,
     pub buffer_capacity: usize,
     pub zmq_send_hwm: i32,
-    pub backpressure_high: f64,
-    pub backpressure_low: f64,
     pub send_retry_interval: Duration,
 }
 
@@ -40,8 +38,6 @@ impl Default for PushSinkConfig {
             endpoint: "tcp://0.0.0.0:0".to_string(),
             buffer_capacity: 500,
             zmq_send_hwm: 50,
-            backpressure_high: 0.8,
-            backpressure_low: 0.6,
             send_retry_interval: Duration::from_millis(50),
         }
     }
@@ -51,7 +47,6 @@ impl Default for PushSinkConfig {
 pub enum SinkState {
     WaitingForPeer { buffered: usize },
     Streaming { peers: usize, buffered: usize },
-    Backpressured { peers: usize, buffered: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,15 +267,6 @@ fn validate_config(c: &PushSinkConfig) -> Result<()> {
     if c.zmq_send_hwm <= 0 {
         return Err(anyhow!("zmq_send_hwm must be > 0"));
     }
-    if !(0.0..=1.0).contains(&c.backpressure_high) {
-        return Err(anyhow!("backpressure_high must be in [0,1]"));
-    }
-    if !(0.0..=1.0).contains(&c.backpressure_low) {
-        return Err(anyhow!("backpressure_low must be in [0,1]"));
-    }
-    if c.backpressure_low > c.backpressure_high {
-        return Err(anyhow!("backpressure_low must be <= backpressure_high"));
-    }
     Ok(())
 }
 
@@ -291,16 +277,9 @@ fn monitor_token() -> String {
     format!("{}-{}", std::process::id(), n)
 }
 
-fn threshold(capacity: usize, fraction: f64) -> usize {
-    let t = ((capacity as f64) * fraction).ceil() as usize;
-    t.max(1).min(capacity)
-}
-
-fn compute_state(peers: usize, buffered: usize, backpressured: bool) -> SinkState {
+fn compute_state(peers: usize, buffered: usize) -> SinkState {
     if peers == 0 {
         SinkState::WaitingForPeer { buffered }
-    } else if backpressured {
-        SinkState::Backpressured { peers, buffered }
     } else {
         SinkState::Streaming { peers, buffered }
     }
@@ -314,7 +293,6 @@ fn state_significantly_differs(a: &SinkState, b: &SinkState) -> bool {
     match (a, b) {
         (WaitingForPeer { .. }, WaitingForPeer { .. }) => false,
         (Streaming { peers: p1, .. }, Streaming { peers: p2, .. }) => p1 != p2,
-        (Backpressured { peers: p1, .. }, Backpressured { peers: p2, .. }) => p1 != p2,
         _ => true,
     }
 }
@@ -383,8 +361,6 @@ fn worker_thread_main(
     }
 
     let cap = config.buffer_capacity;
-    let high = threshold(cap, config.backpressure_high);
-    let low = threshold(cap, config.backpressure_low);
 
     let worker = Worker {
         config,
@@ -398,9 +374,6 @@ fn worker_thread_main(
         peers_atomic,
         shutting_down,
         peers: 0,
-        backpressured: false,
-        high,
-        low,
         cap,
     };
     rt.block_on(worker.run());
@@ -418,9 +391,6 @@ struct Worker {
     peers_atomic: Arc<AtomicUsize>,
     shutting_down: Arc<AtomicBool>,
     peers: usize,
-    backpressured: bool,
-    high: usize,
-    low: usize,
     cap: usize,
 }
 
@@ -440,7 +410,6 @@ impl Worker {
                     let outcome = self.send_group(&group).await;
                     drop(permit);
                     let _ = self.reports.send(DeliveryReport { seq, outcome });
-                    self.reevaluate_backpressure();
                 },
             }
         }
@@ -463,9 +432,6 @@ impl Worker {
             MonitorMsg::PeerDisconnected => self.peers = self.peers.saturating_sub(1),
         }
         self.peers_atomic.store(self.peers, Ordering::Release);
-        if self.peers == 0 {
-            self.backpressured = false;
-        }
     }
 
     fn buffered(&self) -> usize {
@@ -473,7 +439,7 @@ impl Worker {
     }
 
     fn emit_state(&self) {
-        let new = compute_state(self.peers, self.buffered(), self.backpressured);
+        let new = compute_state(self.peers, self.buffered());
         self.state_tx.send_if_modified(|cur| {
             if state_significantly_differs(cur, &new) {
                 *cur = new;
@@ -482,21 +448,6 @@ impl Worker {
                 false
             }
         });
-    }
-
-    /// Called after a permit is released. May transition out of backpressure.
-    fn reevaluate_backpressure(&mut self) {
-        if self.peers == 0 {
-            return;
-        }
-        let buffered = self.buffered();
-        if self.backpressured && buffered < self.low {
-            self.backpressured = false;
-            self.emit_state();
-        } else if !self.backpressured && buffered >= self.high {
-            self.backpressured = true;
-            self.emit_state();
-        }
     }
 
     async fn send_group(&mut self, group: &MultipartGroup) -> DeliveryOutcome {
@@ -554,18 +505,7 @@ impl Worker {
                     None
                 }
             },
-            _ = tokio::time::sleep(retry_interval) => {
-                // We've been EAGAIN-ing with a peer connected; the buffer may
-                // have crossed the high threshold. Reevaluate.
-                if self.peers > 0 {
-                    let buffered = self.buffered();
-                    if !self.backpressured && buffered >= self.high {
-                        self.backpressured = true;
-                        self.emit_state();
-                    }
-                }
-                None
-            },
+            _ = tokio::time::sleep(retry_interval) => None,
         }
     }
 }
@@ -656,8 +596,6 @@ mod tests {
             endpoint: "tcp://127.0.0.1:0".to_string(),
             buffer_capacity: 10,
             zmq_send_hwm: 2,
-            backpressure_high: 0.8,
-            backpressure_low: 0.4,
             send_retry_interval: Duration::from_millis(10),
         }
     }
@@ -732,16 +670,6 @@ mod tests {
     async fn bind_error_negative_hwm() {
         let cfg = PushSinkConfig {
             zmq_send_hwm: 0,
-            ..test_config()
-        };
-        assert!(PushSink::bind(cfg).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn bind_error_inverted_thresholds() {
-        let cfg = PushSinkConfig {
-            backpressure_high: 0.4,
-            backpressure_low: 0.8,
             ..test_config()
         };
         assert!(PushSink::bind(cfg).await.is_err());
@@ -904,8 +832,6 @@ mod tests {
             endpoint: "tcp://127.0.0.1:0".to_string(),
             buffer_capacity: 5,
             zmq_send_hwm: 1,
-            backpressure_high: 0.8,
-            backpressure_low: 0.4,
             send_retry_interval: Duration::from_millis(5),
         };
         let sink = PushSink::bind(cfg).await.unwrap();
@@ -939,67 +865,7 @@ mod tests {
             got_bp_drop,
             "expected to see BackpressureFull drop while peer connected"
         );
-        wait_for(
-            &mut state,
-            |s| matches!(s, SinkState::Backpressured { .. }),
-            Duration::from_secs(3),
-        )
-        .await;
         // Hand peer back so shutdown is clean.
-        drop(peer);
-        sink.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn hysteresis_does_not_flap() {
-        let cfg = PushSinkConfig {
-            endpoint: "tcp://127.0.0.1:0".to_string(),
-            buffer_capacity: 10,
-            zmq_send_hwm: 1,
-            backpressure_high: 0.8, // crosses at 8
-            backpressure_low: 0.4,  // crosses at 4
-            send_retry_interval: Duration::from_millis(5),
-        };
-        let sink = PushSink::bind(cfg).await.unwrap();
-        let port = sink.port().unwrap();
-        let (_ctx, peer) = pull_peer(port);
-        peer.set_rcvhwm(1).unwrap();
-        let mut state = sink.state();
-        wait_for(
-            &mut state,
-            |s| matches!(s, SinkState::Streaming { .. }),
-            Duration::from_secs(3),
-        )
-        .await;
-
-        // Don't drain — flood to backpressured.
-        for i in 0..50u64 {
-            let _ = sink.try_send(i, group(&[b"x"]));
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        wait_for(
-            &mut state,
-            |s| matches!(s, SinkState::Backpressured { .. }),
-            Duration::from_secs(3),
-        )
-        .await;
-
-        // Drain the peer aggressively until backpressure releases.
-        let drain_deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < drain_deadline {
-            match peer.recv_bytes(zmq::DONTWAIT) {
-                Ok(_) => {}
-                Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
-            }
-            if matches!(*state.borrow(), SinkState::Streaming { .. }) {
-                break;
-            }
-        }
-        let final_state = state.borrow().clone();
-        assert!(
-            matches!(final_state, SinkState::Streaming { .. }),
-            "expected return to Streaming after draining; got {final_state:?}"
-        );
         drop(peer);
         sink.shutdown().await;
     }
@@ -1176,8 +1042,6 @@ mod tests {
             endpoint: "tcp://127.0.0.1:0".to_string(),
             buffer_capacity: 20,
             zmq_send_hwm: 5,
-            backpressure_high: 0.8,
-            backpressure_low: 0.4,
             send_retry_interval: Duration::from_millis(5),
         };
         let sink = Arc::new(PushSink::bind(cfg).await.unwrap());

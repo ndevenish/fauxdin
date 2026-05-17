@@ -188,10 +188,12 @@ Specced in full in [`sink.md`](sink.md). Summary:
 
 - Single bounded buffer of `Arc<MultipartGroup>`.
 - Peer count tracked via `zmq_socket_monitor` → state of
-  `WaitingForPeer` / `Streaming` / `Backpressured`.
+  `WaitingForPeer` / `Streaming`.
 - "Buffer full with peer connected" = true backpressure; "buffer full
   with no peer" = startup pad overflowed. Different `DropReason`.
-- Emits a `DeliveryReport` per enqueued group on a `broadcast` channel.
+- Emits a `DeliveryReport` per enqueued group on a `broadcast` channel;
+  this is the authoritative per-message drop signal — the state watch
+  is observability only.
 
 ### `lifecycle` — stream state machine and event emitter
 

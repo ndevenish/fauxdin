@@ -36,10 +36,6 @@ pub struct PushSinkConfig {
     pub buffer_capacity: usize,
     /// ZMQ_SNDHWM applied to the PUSH socket. Must be > 0.
     pub zmq_send_hwm: i32,
-    /// Fraction of `buffer_capacity` at which the sink enters Backpressured
-    /// (with a peer connected). Exits Backpressured at `backpressure_low`.
-    pub backpressure_high: f64,  // e.g. 0.8
-    pub backpressure_low: f64,   // e.g. 0.6
     /// Backoff between ZMQ EAGAIN retries inside the worker.
     pub send_retry_interval: Duration,  // e.g. 50ms
 }
@@ -49,12 +45,10 @@ pub enum SinkState {
     /// Socket bound; no peer has connected. Buffer fills freely up to
     /// `buffer_capacity` — startup pad, not backpressure.
     WaitingForPeer { buffered: usize },
-    /// At least one peer connected; buffer below `backpressure_high`.
+    /// At least one peer connected. Buffer-fill is observable via `buffered`;
+    /// the per-message `DeliveryReport` stream is the authoritative record
+    /// of which groups were actually dropped.
     Streaming { peers: usize, buffered: usize },
-    /// At least one peer connected; buffer at or above `backpressure_high`
-    /// and not yet dropped below `backpressure_low`. New messages subject
-    /// to the drop policy.
-    Backpressured { peers: usize, buffered: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -110,8 +104,8 @@ impl PushSink {
     /// `broadcast::error::RecvError::Lagged` and must reconcile.
     pub fn delivery_reports(&self) -> broadcast::Receiver<DeliveryReport>;
 
-    /// Live state. Updates on every peer event and on every buffer-level
-    /// crossing of the high/low thresholds.
+    /// Live state. Updates on every variant transition and every peer-count
+    /// change; buffered-count differences alone do not trigger emission.
     pub fn state(&self) -> watch::Receiver<SinkState>;
 
     /// Bound TCP port if `endpoint` was `tcp://`; None otherwise.
@@ -182,20 +176,18 @@ State is computed from two inputs:
   `ZMQ_EVENT_DISCONNECTED` (server side of `tcp://`). Clamped at zero.
 - `buffered`: `buffer_capacity - semaphore.available_permits()`.
 
-Transitions (with hysteresis on the buffer threshold to prevent flapping):
+Transitions:
 
-| current               | event                                  | next                       |
+| current               | event              | next               |
 |---|---|---|
-| `WaitingForPeer`      | peer_count → ≥ 1                       | `Streaming`                |
-| `Streaming`           | peer_count → 0                         | `WaitingForPeer`           |
-| `Streaming`           | buffered ≥ `backpressure_high * cap`   | `Backpressured`            |
-| `Backpressured`       | buffered < `backpressure_low * cap`    | `Streaming`                |
-| `Backpressured`       | peer_count → 0                         | `WaitingForPeer`           |
-| `WaitingForPeer`      | buffered == `cap`                      | `WaitingForPeer` (just emit; drops still happen) |
+| `WaitingForPeer`      | peer_count → ≥ 1   | `Streaming`        |
+| `Streaming`           | peer_count → 0     | `WaitingForPeer`   |
 
-The state watcher emits on every transition and every peer-count change.
-It does NOT emit on every buffered-level change — only crossings of the
-thresholds — to avoid swamping subscribers.
+The state watcher emits on variant transitions and on peer-count changes
+within `Streaming`. It does NOT emit on every buffered-level change — the
+authoritative per-message signal is `DeliveryReport`, not the state watch.
+Subscribers that want to react to buffer fill should read `buffered`
+directly when they receive a state update and apply their own threshold.
 
 ### Drop policy
 
@@ -289,10 +281,8 @@ Required test coverage before this is considered done:
 - **Multipart preservation:** push a 4-frame group → peer receives 4
   frames with correct `SNDMORE` flags and original order.
 - **True backpressure:** connect peer that doesn't drain, fill buffer →
-  state transitions through `Streaming` → `Backpressured`, subsequent
-  pushes return `Dropped(BackpressureFull)`.
-- **Hysteresis:** drain peer enough to cross `backpressure_low` → state
-  returns to `Streaming`; bouncing between high and low does not flap.
+  subsequent pushes return `Dropped(BackpressureFull)` while state stays
+  `Streaming`.
 - **Delivery reports:** every `Enqueued` produces exactly one report;
   drops at the door produce zero reports.
 - **Peer disconnect mid-stream:** disconnect peer mid-send → state goes
