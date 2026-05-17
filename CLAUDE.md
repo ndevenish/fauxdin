@@ -1,4 +1,111 @@
-# Fauxdin — Postmortem
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Current state — read this first
+
+This repo is mid-rewrite. The v1 codebase has been deleted; v2 is being built
+from scratch following [`docs/plan.md`](docs/plan.md). The postmortem of v1
+(further down in this file) is referenced by `plan.md` as the record of why
+the previous structure failed — it is *not* a description of what's in `src/`
+today. When in doubt, trust `docs/plan.md` and the per-component spec files
+over the postmortem.
+
+### v2 implementation order (from `docs/plan.md`)
+
+1. `messages` — shared types. **Done** (`src/messages.rs`).
+2. `sink` — buffered PUSH with backpressure detection. Spec in
+   [`docs/sink.md`](docs/sink.md). **In progress** (`src/sink.rs`).
+3. `source` — PULL socket → broadcaster input. Stub (`src/source.rs`).
+4. `broadcaster` — fan-out to subscribers. Stub (`src/broadcaster.rs`).
+5. `lifecycle` — SIMPLON state machine. Stub (`src/lifecycle.rs`).
+6. `capture::folder` — v1 `FolderWriter` semantics on the event trait.
+   Stub (`src/capture/`).
+7. Binary wiring (`src/bin/fauxdin.rs`) — placeholder; do not flesh out
+   until 1-6 are stable.
+8. `control::epics` — later thin adapter; CLI for v1.
+
+Each component gets its own spec file in `docs/` (same shape as `sink.md`:
+Scope / Constraints / Public API / Internal architecture / Invariants /
+Test surface / Open questions / Non-goals) **before** the implementation.
+If you're about to write a component without that spec, write the spec
+first.
+
+### Cross-cutting v2 decisions worth not re-deriving
+
+These are settled and listed in `plan.md`; flagging the ones easy to
+accidentally violate:
+
+- **Multipart groups are the unit of work.** Reassembly happens at the
+  source; every downstream stage handles whole `Arc<MultipartGroup>`s.
+  No mid-multipart drop logic anywhere else in the pipeline.
+- **Sequence numbers are the only correlation key.** Source attaches a
+  monotonic `u64`; sink reports `Delivered(seq)` / `Dropped(seq, reason)`;
+  lifecycle attaches `undelivered_seqs` to `EndSeries` / `AbandonSeries`.
+  Don't invent a second identity scheme.
+- **Mirror and capture are independent subscribers** with different drop
+  policies (`DropNewest` for sink, `NeverDrop` for capture). Capture
+  errors **never** mutate lifecycle state.
+- **`zmq = "0.10"` stays.** `rzmq` was ruled out — see the
+  `zmq-crate-constraint` memory and the constraints section of `sink.md`.
+  Wrap blocking ZMQ I/O in `spawn_blocking` worker threads.
+- **`Bytes` for frame storage.** `tokio_util::bytes::Bytes` — one copy at
+  the PULL read, `Arc`-cloned everywhere after.
+
+## Build, test, lint
+
+```
+cargo build                            # debug build
+cargo test                             # all unit tests
+cargo test -p fauxdin sink::tests::    # single module's tests
+cargo test sink::tests::bind_success_ephemeral_port -- --nocapture
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+```
+
+Pre-commit (`.pre-commit-config.yaml`) runs `cargo fmt`, `cargo clippy`,
+and `cargo check`. The sink tests bind ephemeral TCP ports and start
+blocking worker threads — they're real integration tests of `zmq` and
+take real time; expect a few seconds for the suite.
+
+The `epicars` and `gw-eiger` submodules are vendored dependencies; you
+don't normally need to build inside them.
+
+## Layout reference (current)
+
+```
+src/
+  bin/fauxdin.rs    placeholder binary
+  messages.rs       Step 1: MultipartGroup, Seq, StreamEvent, ...
+  sink.rs           Step 2: PushSink (per docs/sink.md)
+  source.rs         stub
+  broadcaster.rs    stub
+  lifecycle.rs      stub
+  control.rs        stub
+  capture/          stub (folder.rs, mod.rs)
+  old/              v1 code, NOT in the module tree — kept for reference only
+docs/
+  plan.md           v2 architecture (start here)
+  sink.md           sink spec
+epicars/            git submodule — EPICS CA server
+gw-eiger/           git submodule — reference Eiger tooling
+contrib/            thor.py, loki.py — stream record/replay helpers
+dumps/              captured per-series SIMPLON streams (test fixtures)
+scratch/            local-only working area
+```
+
+`src/old/` is excluded from the module tree on purpose. Don't add a `pub
+mod old;` to `lib.rs`; if you need to crib something from v1, copy and
+adapt rather than wiring the old modules in.
+
+---
+
+# Fauxdin — v1 Postmortem (historical)
+
+The rest of this file is the v1 retrospective referenced by
+[`docs/plan.md`](docs/plan.md). It describes code that no longer exists
+in `src/` (some still in `src/old/`) — read it for context on why v2 is
+shaped the way it is, not as a guide to the current layout.
 
 ## What it was meant to be
 
@@ -114,7 +221,7 @@ Don't extend this structure. The right re-architecture is something like:
 - Tests for the lifecycle and writer paths, with synthetic SIMPLON
   message sequences, before adding any new transport.
 
-## Layout reference
+## v1 layout reference (no longer present)
 
 ```
 src/
@@ -122,9 +229,6 @@ src/
   zmq.rs            BufferedPushSocket, PullSocket
   writers.rs        DetectorHeader, AcquisitionLifecycle, FolderWriter, S3Writer
   lib.rs            re-exports zmq, writers
-epicars/            git submodule — EPICS CA server
-gw-eiger/           git submodule — reference Eiger tooling
-contrib/            thor.py, loki.py, send.py, test.py — stream helpers
-dumps/              captured per-series output (gitignored content)
-scratch/            local-only working area
 ```
+
+For the current (v2) layout see the top of this file.
