@@ -61,6 +61,18 @@ impl Default for PushSinkConfig {
     }
 }
 
+impl PushSinkConfig {
+    fn validate(&self) -> Result<()> {
+        if self.buffer_capacity == 0 {
+            return Err(anyhow!("buffer_capacity must be > 0"));
+        }
+        if self.zmq_send_hwm <= 0 {
+            return Err(anyhow!("zmq_send_hwm must be > 0"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkState {
     WaitingForPeer { buffered: usize },
@@ -116,7 +128,7 @@ impl PushSink {
     /// Bind the PUSH socket, start the worker and monitor threads, and
     /// return once the socket is bound (so [`port`](Self::port) is valid).
     pub async fn bind(config: PushSinkConfig) -> Result<Self> {
-        validate_config(&config)?;
+        config.validate()?;
 
         let ctx = zmq::Context::new();
         let cancel = config.cancel.clone();
@@ -276,16 +288,6 @@ struct WorkItem {
 enum MonitorMsg {
     PeerConnected,
     PeerDisconnected,
-}
-
-fn validate_config(c: &PushSinkConfig) -> Result<()> {
-    if c.buffer_capacity == 0 {
-        return Err(anyhow!("buffer_capacity must be > 0"));
-    }
-    if c.zmq_send_hwm <= 0 {
-        return Err(anyhow!("zmq_send_hwm must be > 0"));
-    }
-    Ok(())
 }
 
 fn monitor_token() -> String {
