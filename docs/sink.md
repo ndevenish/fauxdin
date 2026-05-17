@@ -36,7 +36,13 @@ pub struct PushSinkConfig {
     pub buffer_capacity: usize,
     /// ZMQ_SNDHWM applied to the PUSH socket. Must be > 0.
     pub zmq_send_hwm: i32,
-    /// Backoff between ZMQ EAGAIN retries inside the worker.
+    /// Backoff between retries when libzmq returns `EAGAIN` on `send`.
+    /// The worker sends with `DONTWAIT` so it stays reactive to cancel
+    /// and peer-monitor events; on `EAGAIN` it sleeps this interval
+    /// before retrying, also waking on cancel or peer disconnect during
+    /// the sleep. The sync `zmq` crate has no POLLOUT-style hook that
+    /// composes with tokio, so a timed retry is the pragmatic
+    /// alternative — adds at most one interval of latency per retry.
     pub send_retry_interval: Duration,  // e.g. 50ms
 }
 
