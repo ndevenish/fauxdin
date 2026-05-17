@@ -44,6 +44,12 @@ pub struct PushSinkConfig {
     /// composes with tokio, so a timed retry is the pragmatic
     /// alternative — adds at most one interval of latency per retry.
     pub send_retry_interval: Duration,  // e.g. 50ms
+    /// Cancellation token. Cancelling it (from anywhere) drains the buffer
+    /// and stops the worker, identical to calling `shutdown()`. Default: a
+    /// fresh token. Pass a child of a parent pipeline token when wiring
+    /// into a larger process so one `cancel()` tears the whole pipeline
+    /// down.
+    pub cancel: CancellationToken,
 }
 
 #[derive(Clone, Debug)]

@@ -41,6 +41,12 @@ pub struct PushSinkConfig {
     /// alternative: low CPU, adds at most one interval of latency per
     /// retry. Tune down (e.g. 5ms) in tests where retry latency matters.
     pub send_retry_interval: Duration,
+    /// Cancellation token. The sink clones this and stores it; cancelling it
+    /// (from anywhere) drains the buffer and stops the worker, identically to
+    /// calling [`PushSink::shutdown`]. Default: a fresh token owned only by
+    /// this sink. Pass a child of a parent pipeline token when wiring into a
+    /// larger process so one `cancel()` tears the whole pipeline down.
+    pub cancel: CancellationToken,
 }
 
 impl Default for PushSinkConfig {
@@ -50,6 +56,7 @@ impl Default for PushSinkConfig {
             buffer_capacity: 500,
             zmq_send_hwm: 50,
             send_retry_interval: Duration::from_millis(50),
+            cancel: CancellationToken::new(),
         }
     }
 }
@@ -112,7 +119,7 @@ impl PushSink {
         validate_config(&config)?;
 
         let ctx = zmq::Context::new();
-        let cancel = CancellationToken::new();
+        let cancel = config.cancel.clone();
         let permits = Arc::new(Semaphore::new(config.buffer_capacity));
         let peers = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -608,6 +615,7 @@ mod tests {
             buffer_capacity: 10,
             zmq_send_hwm: 2,
             send_retry_interval: Duration::from_millis(10),
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -840,10 +848,10 @@ mod tests {
     #[tokio::test]
     async fn true_backpressure_drops_with_backpressure_full() {
         let cfg = PushSinkConfig {
-            endpoint: "tcp://127.0.0.1:0".to_string(),
             buffer_capacity: 5,
             zmq_send_hwm: 1,
             send_retry_interval: Duration::from_millis(5),
+            ..test_config()
         };
         let sink = PushSink::bind(cfg).await.unwrap();
         let port = sink.port().unwrap();
@@ -1050,10 +1058,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_senders_preserve_permit_conservation() {
         let cfg = PushSinkConfig {
-            endpoint: "tcp://127.0.0.1:0".to_string(),
             buffer_capacity: 20,
             zmq_send_hwm: 5,
             send_retry_interval: Duration::from_millis(5),
+            ..test_config()
         };
         let sink = Arc::new(PushSink::bind(cfg).await.unwrap());
         let port = sink.port().unwrap();
