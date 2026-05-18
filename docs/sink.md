@@ -30,8 +30,6 @@ without changing the API).
 pub struct PushSink { /* opaque */ }
 
 pub struct PushSinkConfig {
-    /// e.g. "tcp://0.0.0.0:9998" or "tcp://*:*" for ephemeral port.
-    pub endpoint: String,
     /// Number of multipart groups the in-process buffer can hold. Hard cap.
     pub buffer_capacity: usize,
     /// ZMQ_SNDHWM applied to the PUSH socket. Must be > 0.
@@ -103,8 +101,9 @@ pub enum EnqueueOutcome {
 impl PushSink {
     /// Bind the socket, start the worker thread, and wait for both to come
     /// up. Returns once the socket is bound (so `port()` is valid) or with
-    /// an error if bind fails.
-    pub async fn bind(config: PushSinkConfig) -> Result<Self>;
+    /// an error if bind fails. `endpoint` is e.g. `"tcp://0.0.0.0:9998"`
+    /// or `"tcp://127.0.0.1:0"` for an ephemeral port.
+    pub async fn bind(endpoint: &str, config: PushSinkConfig) -> Result<Self>;
 
     /// Non-blocking enqueue. Multipart groups are atomic. Never blocks the
     /// caller, never waits on the socket.

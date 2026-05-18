@@ -26,8 +26,18 @@ const DELIVERY_BROADCAST_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct PushSinkConfig {
-    pub endpoint: String,
+    /// The total allowed enqueued messages. The actual number of
+    /// currently buffered messages may be higher than this, if it was
+    /// resized while above the new capacity.
     pub buffer_capacity: usize,
+    /// In addition to this buffer, the ZeroMQ socket itself will be set up
+    /// with a high water mark capacity of `zmq_send_hmw`, so the maximum
+    /// number of messages that can be buffered is `presocket_queue_length +
+    /// zmq_send_hwm + 1`, depending on whether the ZeroMQ socket is internally
+    /// buffering (it does not do this before being connected to, for
+    /// instance). Whereas normally in ZMQ a HWM of zero means "no limit", here
+    /// it will cause an error, because if you want an unlimited buffer then
+    /// this socket wrapper is unnecessary.
     pub zmq_send_hwm: i32,
     /// Backoff between retries when libzmq returns `EAGAIN` on `send`.
     ///
@@ -52,7 +62,6 @@ pub struct PushSinkConfig {
 impl Default for PushSinkConfig {
     fn default() -> Self {
         Self {
-            endpoint: "tcp://0.0.0.0:0".to_string(),
             buffer_capacity: 500,
             zmq_send_hwm: 50,
             send_retry_interval: Duration::from_millis(50),
@@ -127,7 +136,7 @@ pub struct PushSink {
 impl PushSink {
     /// Bind the PUSH socket, start the worker and monitor threads, and
     /// return once the socket is bound (so [`port`](Self::port) is valid).
-    pub async fn bind(config: PushSinkConfig) -> Result<Self> {
+    pub async fn bind(endpoint: &str, config: PushSinkConfig) -> Result<Self> {
         config.validate()?;
 
         let ctx = zmq::Context::new();
@@ -153,8 +162,10 @@ impl PushSink {
             let reports = reports_tx.clone();
             let shutting_down = shutting_down.clone();
             let monitor_endpoint = monitor_endpoint.clone();
+            let endpoint = endpoint.to_string();
             tokio::task::spawn_blocking(move || {
                 worker_thread_main(
+                    endpoint,
                     config,
                     ctx,
                     outbox_rx,
@@ -319,6 +330,7 @@ fn state_significantly_differs(a: &SinkState, b: &SinkState) -> bool {
 
 fn build_socket(
     ctx: &zmq::Context,
+    endpoint: &str,
     config: &PushSinkConfig,
     monitor_endpoint: &str,
 ) -> Result<zmq::Socket> {
@@ -330,8 +342,8 @@ fn build_socket(
     let events = zmq::SocketEvent::ACCEPTED as i32 | zmq::SocketEvent::DISCONNECTED as i32;
     sock.monitor(monitor_endpoint, events)
         .map_err(|e| anyhow!("monitor setup failed: {e}"))?;
-    sock.bind(&config.endpoint)
-        .map_err(|e| anyhow!("bind to {} failed: {e}", config.endpoint))?;
+    sock.bind(endpoint)
+        .map_err(|e| anyhow!("bind to {endpoint} failed: {e}"))?;
     Ok(sock)
 }
 
@@ -342,6 +354,7 @@ fn port_from_socket(sock: &zmq::Socket) -> Option<u16> {
 
 #[allow(clippy::too_many_arguments)]
 fn worker_thread_main(
+    endpoint: String,
     config: PushSinkConfig,
     ctx: zmq::Context,
     outbox: mpsc::UnboundedReceiver<WorkItem>,
@@ -366,7 +379,7 @@ fn worker_thread_main(
         }
     };
 
-    let sock = match build_socket(&ctx, &config, &monitor_endpoint) {
+    let sock = match build_socket(&ctx, &endpoint, &config, &monitor_endpoint) {
         Ok(s) => s,
         Err(e) => {
             let _ = launch.send(Err(e));
@@ -611,9 +624,10 @@ mod tests {
         })
     }
 
+    const TEST_ENDPOINT: &str = "tcp://127.0.0.1:0";
+
     fn test_config() -> PushSinkConfig {
         PushSinkConfig {
-            endpoint: "tcp://127.0.0.1:0".to_string(),
             buffer_capacity: 10,
             zmq_send_hwm: 2,
             send_retry_interval: Duration::from_millis(10),
@@ -663,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_success_ephemeral_port() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().expect("ephemeral bind must report a port");
         assert!(port > 0);
         sink.shutdown().await;
@@ -671,11 +685,11 @@ mod tests {
 
     #[tokio::test]
     async fn bind_error_invalid_endpoint() {
-        let cfg = PushSinkConfig {
-            endpoint: "not-a-real-endpoint".to_string(),
-            ..test_config()
-        };
-        assert!(PushSink::bind(cfg).await.is_err());
+        assert!(
+            PushSink::bind("not-a-real-endpoint", test_config())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -684,7 +698,7 @@ mod tests {
             buffer_capacity: 0,
             ..test_config()
         };
-        assert!(PushSink::bind(cfg).await.is_err());
+        assert!(PushSink::bind(TEST_ENDPOINT, cfg).await.is_err());
     }
 
     #[tokio::test]
@@ -693,14 +707,14 @@ mod tests {
             zmq_send_hwm: 0,
             ..test_config()
         };
-        assert!(PushSink::bind(cfg).await.is_err());
+        assert!(PushSink::bind(TEST_ENDPOINT, cfg).await.is_err());
     }
 
     // ------- buffer & door-drop behaviour -------
 
     #[tokio::test]
     async fn pre_peer_buffering_fills_then_overflows() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         for i in 0..10u64 {
             assert_eq!(
                 sink.try_send(i, group(&[b"x"])),
@@ -723,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn door_drops_emit_no_delivery_report() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let mut reports = sink.delivery_reports();
         // Fill the buffer with no peer.
         for i in 0..10u64 {
@@ -752,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_transitions_state_to_streaming() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
         let mut state = sink.state();
         assert!(matches!(*state.borrow(), SinkState::WaitingForPeer { .. }));
@@ -780,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_disconnect_returns_to_waiting_for_peer() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
         let mut state = sink.state();
         let (ctx, peer) = pull_peer(port);
@@ -806,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_group_arrives_intact() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
         let (_ctx, peer) = pull_peer(port);
         let mut state = sink.state();
@@ -828,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_frame_group_arrives_intact() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
         let (_ctx, peer) = pull_peer(port);
         let mut state = sink.state();
@@ -855,7 +869,7 @@ mod tests {
             send_retry_interval: Duration::from_millis(5),
             ..test_config()
         };
-        let sink = PushSink::bind(cfg).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap();
         let port = sink.port().unwrap();
         let (_ctx, peer) = pull_peer(port);
         peer.set_rcvhwm(1).unwrap();
@@ -895,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_enqueued_produces_a_report() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
         let mut reports = sink.delivery_reports();
         let (_ctx, peer) = pull_peer(port);
@@ -940,7 +954,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_drains_buffer_with_sink_shutdown_reports() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let mut reports = sink.delivery_reports();
         // No peer — every message sits in our buffer or in the worker's
         // in-progress send.
@@ -985,7 +999,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_send_after_shutdown_returns_shutting_down() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         // We can't call shutdown(self) and then try_send. Instead, set the
         // flag manually via Drop semantics: keep a clone of the cancel token
         // by holding a state receiver alive, drop the sink, see that
@@ -1048,7 +1062,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_idempotent_via_drop() {
-        let sink = PushSink::bind(test_config()).await.unwrap();
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         // Drop without calling shutdown — Drop impl must cancel cleanly.
         drop(sink);
         // If Drop hangs or panics this test never returns; that itself is
@@ -1065,7 +1079,7 @@ mod tests {
             send_retry_interval: Duration::from_millis(5),
             ..test_config()
         };
-        let sink = Arc::new(PushSink::bind(cfg).await.unwrap());
+        let sink = Arc::new(PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap());
         let port = sink.port().unwrap();
         let (_ctx, peer) = pull_peer(port);
         let mut state = sink.state();
