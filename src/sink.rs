@@ -181,8 +181,18 @@ pub struct PushSink {
     reports_tx: broadcast::Sender<DeliveryReport>,
     worker: Option<JoinHandle<()>>,
     monitor: Option<JoinHandle<()>>,
+    capacity: Option<JoinHandle<()>>,
     port: Option<u16>,
-    buffer_capacity: usize,
+    /// Currently-effective buffer capacity. Driven by the capacity task in
+    /// response to `set_buffer_capacity` writes on `cap_tx`. The semaphore
+    /// is the source of truth for whether a send is admitted; this is for
+    /// reporting and for `buffered()` computation.
+    current_cap: Arc<AtomicUsize>,
+    /// Outstanding shrink debt: permits that still need to be forgotten to
+    /// realise a capacity reduction that overlapped in-flight items. Drained
+    /// by the capacity task as permits are returned.
+    debt: Arc<AtomicUsize>,
+    cap_tx: watch::Sender<usize>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -212,14 +222,16 @@ impl PushSink {
         let permits = Arc::new(Semaphore::new(config.buffer_capacity));
         let peers = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let current_cap = Arc::new(AtomicUsize::new(config.buffer_capacity));
+        let debt = Arc::new(AtomicUsize::new(0));
         let (tx, outbox_rx) = mpsc::unbounded_channel::<WorkItem>();
         let (reports_tx, _) = broadcast::channel(DELIVERY_BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(SinkState::WaitingForPeer { buffered: 0 });
         let (monitor_tx, monitor_rx) = mpsc::unbounded_channel::<MonitorMsg>();
         let (launch_tx, launch_rx) = oneshot::channel::<Result<Option<u16>>>();
+        let (cap_tx, cap_rx) = watch::channel(config.buffer_capacity);
 
         let monitor_endpoint = format!("inproc://fauxdin-sink-monitor-{}", monitor_token());
-        let buffer_capacity = config.buffer_capacity;
 
         let worker_handle = {
             let ctx = ctx.clone();
@@ -231,6 +243,8 @@ impl PushSink {
             let shutting_down = shutting_down.clone();
             let monitor_endpoint = monitor_endpoint.clone();
             let endpoint = endpoint.to_string();
+            let current_cap = current_cap.clone();
+            let debt = debt.clone();
             tokio::task::spawn_blocking(move || {
                 worker_thread_main(
                     endpoint,
@@ -246,6 +260,8 @@ impl PushSink {
                     launch_tx,
                     monitor_endpoint,
                     shutting_down,
+                    current_cap,
+                    debt,
                 );
             })
         };
@@ -271,6 +287,16 @@ impl PushSink {
             })
         };
 
+        let capacity_handle = {
+            let permits = permits.clone();
+            let cancel = cancel.clone();
+            let current_cap = current_cap.clone();
+            let debt = debt.clone();
+            tokio::spawn(async move {
+                capacity_task(cap_rx, permits, current_cap, debt, cancel).await;
+            })
+        };
+
         Ok(Self {
             cancel,
             tx,
@@ -280,8 +306,11 @@ impl PushSink {
             reports_tx,
             worker: Some(worker_handle),
             monitor: Some(monitor_handle),
+            capacity: Some(capacity_handle),
             port,
-            buffer_capacity,
+            current_cap,
+            debt,
+            cap_tx,
             shutting_down,
         })
     }
@@ -325,8 +354,30 @@ impl PushSink {
         self.port
     }
 
+    /// Currently-effective buffer capacity. May differ from
+    /// `PushSinkConfig::buffer_capacity` if `set_buffer_capacity` has been
+    /// called since `bind`.
     pub fn buffer_capacity(&self) -> usize {
-        self.buffer_capacity
+        self.current_cap.load(Ordering::Acquire)
+    }
+
+    /// Resize the in-process buffer. Implemented as a hand-off to the
+    /// background capacity task — the send path is untouched.
+    ///
+    /// Growing is immediate (extra permits are added to the semaphore).
+    /// Shrinking forgets as many available permits as it can; any
+    /// outstanding overshoot becomes `debt` that is paid off opportunistically
+    /// as in-flight items complete and release their permits.
+    pub fn set_buffer_capacity(&self, new_cap: usize) -> Result<()> {
+        if new_cap == 0 {
+            return Err(anyhow!("buffer_capacity must be > 0"));
+        }
+        // Channel can only "fail" if all receivers are gone — i.e. capacity
+        // task has exited. Treat that as "sink is shutting down".
+        if self.cap_tx.send(new_cap).is_err() {
+            return Err(anyhow!("sink is shutting down"));
+        }
+        Ok(())
     }
 
     /// Initiate shutdown. Drains the buffer, emitting `Dropped(SinkShutdown)`
@@ -339,6 +390,9 @@ impl PushSink {
             let _ = h.await;
         }
         if let Some(h) = self.monitor.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.capacity.take() {
             let _ = h.await;
         }
     }
@@ -435,6 +489,8 @@ fn worker_thread_main(
     launch: oneshot::Sender<Result<Option<u16>>>,
     monitor_endpoint: String,
     shutting_down: Arc<AtomicBool>,
+    current_cap: Arc<AtomicUsize>,
+    debt: Arc<AtomicUsize>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -461,8 +517,6 @@ fn worker_thread_main(
         return;
     }
 
-    let cap = config.buffer_capacity;
-
     let worker = Worker {
         config,
         sock,
@@ -475,7 +529,8 @@ fn worker_thread_main(
         peers_atomic,
         shutting_down,
         peers: 0,
-        cap,
+        current_cap,
+        debt,
     };
     rt.block_on(worker.run());
 }
@@ -492,7 +547,8 @@ struct Worker {
     peers_atomic: Arc<AtomicUsize>,
     shutting_down: Arc<AtomicBool>,
     peers: usize,
-    cap: usize,
+    current_cap: Arc<AtomicUsize>,
+    debt: Arc<AtomicUsize>,
 }
 
 impl Worker {
@@ -536,7 +592,12 @@ impl Worker {
     }
 
     fn buffered(&self) -> usize {
-        self.cap.saturating_sub(self.permits.available_permits())
+        // After a shrink, some "consumed" slots are accounted as `debt` rather
+        // than as outstanding permits, so the effective denominator is
+        // `current_cap + debt`.
+        let cap = self.current_cap.load(Ordering::Acquire);
+        let debt = self.debt.load(Ordering::Acquire);
+        (cap + debt).saturating_sub(self.permits.available_permits())
     }
 
     fn emit_state(&self) {
@@ -673,6 +734,101 @@ fn monitor_thread_main(
         }
     }
     debug!("sink monitor exiting");
+}
+
+/// Owns the live `current_cap` and `debt` atomics; reconciles them with the
+/// underlying semaphore when `cap_rx` changes, and drains shrink-debt as
+/// permits come back. The send and receive paths never touch any of this —
+/// they only see the semaphore state that this task arranges.
+async fn capacity_task(
+    mut cap_rx: watch::Receiver<usize>,
+    permits: Arc<Semaphore>,
+    current_cap: Arc<AtomicUsize>,
+    debt: Arc<AtomicUsize>,
+    cancel: CancellationToken,
+) {
+    // Receiver starts at version 0, same as the sender's initial version, so
+    // `changed()` only fires on real sends. Crucially, we do NOT call
+    // `mark_unchanged()` — a `set_buffer_capacity` call that lands between
+    // `bind` returning and this task's first poll must still wake us, and
+    // `mark_unchanged` would silently consume that wake-up.
+    loop {
+        let outstanding = debt.load(Ordering::Acquire);
+        if outstanding > 0 {
+            // Race the next cap change against a permit becoming available so
+            // we can forget it and pay down debt one slot at a time.
+            let acquire = permits.clone().acquire_owned();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                changed = cap_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let new_cap = *cap_rx.borrow_and_update();
+                    apply_cap_change(&permits, &current_cap, &debt, new_cap);
+                }
+                permit = acquire => {
+                    match permit {
+                        Ok(p) => {
+                            p.forget();
+                            debt.fetch_sub(1, Ordering::AcqRel);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                changed = cap_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let new_cap = *cap_rx.borrow_and_update();
+                    apply_cap_change(&permits, &current_cap, &debt, new_cap);
+                }
+            }
+        }
+    }
+    debug!("sink capacity task exiting");
+}
+
+/// Apply a single capacity change. Grows hand `add_permits` to the semaphore
+/// (after first paying down any existing debt). Shrinks attempt
+/// `forget_permits` for the whole delta and record any unmet portion as new
+/// debt for the task loop to drain later.
+fn apply_cap_change(
+    permits: &Arc<Semaphore>,
+    current_cap: &Arc<AtomicUsize>,
+    debt: &Arc<AtomicUsize>,
+    new_cap: usize,
+) {
+    if new_cap == 0 {
+        // Validation in `set_buffer_capacity` prevents this; defend anyway.
+        return;
+    }
+    let old_cap = current_cap.load(Ordering::Acquire);
+    if new_cap == old_cap {
+        return;
+    }
+    if new_cap > old_cap {
+        let mut to_add = new_cap - old_cap;
+        let cur_debt = debt.load(Ordering::Acquire);
+        if cur_debt > 0 {
+            let pay = cur_debt.min(to_add);
+            debt.fetch_sub(pay, Ordering::AcqRel);
+            to_add -= pay;
+        }
+        if to_add > 0 {
+            permits.add_permits(to_add);
+        }
+    } else {
+        let want = old_cap - new_cap;
+        let forgotten = permits.forget_permits(want);
+        let unmet = want - forgotten;
+        if unmet > 0 {
+            debt.fetch_add(unmet, Ordering::AcqRel);
+        }
+    }
+    current_cap.store(new_cap, Ordering::Release);
 }
 
 // ============================================================================
@@ -1135,6 +1291,150 @@ mod tests {
         drop(sink);
         // If Drop hangs or panics this test never returns; that itself is
         // the assertion.
+    }
+
+    // ------- runtime resize -------
+
+    #[tokio::test]
+    async fn set_buffer_capacity_zero_is_rejected() {
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
+        assert!(sink.set_buffer_capacity(0).is_err());
+        assert_eq!(sink.buffer_capacity(), 10);
+        sink.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn grow_capacity_admits_previously_rejected_sends() {
+        let cfg = PushSinkConfig {
+            buffer_capacity: 3,
+            ..test_config()
+        };
+        let sink = PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap();
+        // Fill the original cap.
+        for i in 0..3u64 {
+            assert_eq!(sink.try_send(i, group(&[b"x"])), EnqueueOutcome::Enqueued);
+        }
+        assert_eq!(
+            sink.try_send(99, group(&[b"x"])),
+            EnqueueOutcome::Dropped(DropReason::PrefetchOverflow)
+        );
+
+        // Grow and let the capacity task observe the watch.
+        sink.set_buffer_capacity(6).unwrap();
+        for _ in 0..50 {
+            if sink.buffer_capacity() == 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(sink.buffer_capacity(), 6);
+
+        // Now three more sends should be accepted.
+        for i in 10..13u64 {
+            assert_eq!(sink.try_send(i, group(&[b"x"])), EnqueueOutcome::Enqueued);
+        }
+        assert_eq!(
+            sink.try_send(199, group(&[b"x"])),
+            EnqueueOutcome::Dropped(DropReason::PrefetchOverflow)
+        );
+        sink.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shrink_capacity_within_occupancy_forgets_available_permits() {
+        let cfg = PushSinkConfig {
+            buffer_capacity: 10,
+            ..test_config()
+        };
+        let sink = PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap();
+        // Use 3 of 10 (no peer, so they sit in the buffer).
+        for i in 0..3u64 {
+            assert_eq!(sink.try_send(i, group(&[b"x"])), EnqueueOutcome::Enqueued);
+        }
+        // Shrink to 5. Occupancy is 3, so 5 free permits get forgotten and 2
+        // free permits remain. No debt expected.
+        sink.set_buffer_capacity(5).unwrap();
+        for _ in 0..50 {
+            if sink.buffer_capacity() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Two more enqueues must succeed, a third must fail.
+        for i in 100..102u64 {
+            assert_eq!(sink.try_send(i, group(&[b"x"])), EnqueueOutcome::Enqueued);
+        }
+        assert_eq!(
+            sink.try_send(199, group(&[b"x"])),
+            EnqueueOutcome::Dropped(DropReason::PrefetchOverflow)
+        );
+        sink.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shrink_capacity_below_occupancy_accumulates_debt_and_drains() {
+        let cfg = PushSinkConfig {
+            buffer_capacity: 10,
+            zmq_send_hwm: 1,
+            send_retry_interval: Duration::from_millis(5),
+            ..test_config()
+        };
+        let sink = PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap();
+        // Fill to 8 with no peer.
+        for i in 0..8u64 {
+            assert_eq!(sink.try_send(i, group(&[b"x"])), EnqueueOutcome::Enqueued);
+        }
+        // Shrink to 3 — only 2 permits are immediately forgettable (the 2 still
+        // free); the remaining 5 become debt.
+        sink.set_buffer_capacity(3).unwrap();
+        for _ in 0..50 {
+            if sink.buffer_capacity() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // No new sends should be admitted right now.
+        assert!(matches!(
+            sink.try_send(99, group(&[b"x"])),
+            EnqueueOutcome::Dropped(_),
+        ));
+
+        // Attach a peer and drain so the worker releases permits; the capacity
+        // task will eat them to pay down the debt.
+        let port = sink.port().unwrap();
+        let (_ctx, peer) = pull_peer(port);
+        let drain = tokio::task::spawn_blocking(move || {
+            peer.set_rcvtimeo(2000).unwrap();
+            for _ in 0..8 {
+                let _ = peer.recv_bytes(0).unwrap();
+            }
+            peer
+        });
+        let _peer = drain.await.unwrap();
+
+        // Once everything has flushed and debt is paid, exactly 3 fresh sends
+        // should be admitted.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut admitted = 0;
+        while Instant::now() < deadline && admitted < 3 {
+            match sink.try_send(200 + admitted as u64, group(&[b"y"])) {
+                EnqueueOutcome::Enqueued => admitted += 1,
+                EnqueueOutcome::Dropped(_) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("unexpected outcome during drain wait: {other:?}"),
+            }
+        }
+        assert_eq!(
+            admitted, 3,
+            "expected new capacity of 3 to be available after debt drains"
+        );
+        assert_eq!(
+            sink.try_send(999, group(&[b"y"])),
+            EnqueueOutcome::Dropped(DropReason::BackpressureFull),
+            "fourth send must fail at the shrunken cap"
+        );
+        sink.shutdown().await;
     }
 
     // ------- concurrency -------

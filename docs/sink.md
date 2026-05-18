@@ -10,10 +10,10 @@ bounded in-process buffer.
 detection, per-message delivery reporting, atomic multipart preservation,
 clean shutdown.
 
-**Out (deferred to a later revision):** runtime buffer resize, multi-endpoint
-fan-out, transport other than ZMQ PUSH, EPICS PV control surface (the state
-watcher and config fields are designed so EPICS bindings can be added later
-without changing the API).
+**Out (deferred to a later revision):** multi-endpoint fan-out, transport
+other than ZMQ PUSH, EPICS PV control surface (the state watcher and config
+fields are designed so EPICS bindings can be added later without changing
+the API).
 
 ## Constraints
 
@@ -122,6 +122,20 @@ impl PushSink {
     /// Bound TCP port if `endpoint` was `tcp://`; None otherwise.
     pub fn port(&self) -> Option<u16>;
 
+    /// Currently-effective buffer capacity. Equal to
+    /// `PushSinkConfig::buffer_capacity` immediately after `bind`; reflects
+    /// the last `set_buffer_capacity` call once the capacity task has
+    /// applied it.
+    pub fn buffer_capacity(&self) -> usize;
+
+    /// Resize the in-process buffer at runtime. Hands the new capacity to a
+    /// background task that adjusts the existing semaphore — the send and
+    /// receive paths are untouched. Growing is immediate; shrinking forgets
+    /// as many available permits as it can and records the remainder as
+    /// debt to be paid down as in-flight items complete. Returns `Err` for
+    /// `0` or if the sink is shutting down.
+    pub fn set_buffer_capacity(&self, new_cap: usize) -> Result<()>;
+
     /// Initiate shutdown. Any messages still in the buffer that have not
     /// been handed to the PUSH socket emit `Dropped(SinkShutdown)`. The
     /// future resolves once the worker thread has joined and the socket is
@@ -155,13 +169,16 @@ async caller ──try_send──→ outbox (mpsc::UnboundedSender + Semaphore)
         └─────────────────────────────────────────────────────────┘
 ```
 
-Two threads in total:
+Three concurrent components in total:
 
 1. **Worker thread** (`spawn_blocking` running a current-thread runtime).
    Owns the PUSH socket. Drives the send loop. Updates `SinkState`.
 2. **Monitor reader** (`spawn_blocking` with a plain loop). Opens the
    inproc PAIR for `zmq_socket_monitor` and forwards parsed events into a
    tokio `mpsc` consumed by the worker.
+3. **Capacity task** (`tokio::spawn`, pure async). Listens on a
+   `watch::Receiver<usize>` and reconciles `current_cap` / `debt` with the
+   shared semaphore. Does not touch the socket or `state`.
 
 The monitor reader is its own thread because libzmq's monitor PAIR is read
 synchronously, and we don't want to interleave it with the send loop. It's
@@ -169,23 +186,42 @@ small and dies on socket close.
 
 ### Buffer / permit accounting
 
-- `Arc<Semaphore>` with `buffer_capacity` permits.
+- `Arc<Semaphore>` with `current_cap` initial permits.
 - `try_send` takes a permit synchronously (`try_acquire_owned`). If
   available, the permit is bundled into the outbox message and dropped on
   dequeue inside the worker. If unavailable, the message is rejected.
 - No "force enqueue mid-multipart" path — groups are atomic, so the buffer
   unit equals the permit unit equals the drop unit.
-- No runtime resize in v1. When EPICS control is added, the only addition
-  is a `watch::Receiver<usize>` that a separate task uses to call
-  `add_permits` / `forget_permits` on the same semaphore. The send and
-  receive paths do not change.
+
+#### Runtime resize
+
+A `watch::Sender<usize>` (`cap_tx`) lives on the sink and is the only way
+to change capacity. `set_buffer_capacity(n)` validates `n > 0` and writes
+to that watch. The capacity task is the sole reader and the sole writer of
+the shared `current_cap` / `debt` atomics:
+
+- **Grow** (`new > old`): if there's outstanding shrink debt, pay it down
+  first by decrementing `debt`. Any remainder is handed to
+  `Semaphore::add_permits`.
+- **Shrink** (`new < old`): call `Semaphore::forget_permits(old - new)`,
+  which removes only the *available* permits and returns the count
+  actually forgotten. Any shortfall is added to `debt`. While `debt > 0`,
+  the capacity task also waits on `Semaphore::acquire_owned`; each permit
+  returned by a completed send is forgotten and decrements `debt` by one.
+- `current_cap` is written last on every change so observers see a
+  consistent denominator for `buffered` (see below).
+
+The send path (`try_send` and the worker's send loop) never sees any of
+this — it just observes the semaphore the capacity task has shaped.
 
 ### State derivation
 
 State is computed from two inputs:
 - `peer_count`: incremented on `ZMQ_EVENT_ACCEPTED`, decremented on
   `ZMQ_EVENT_DISCONNECTED` (server side of `tcp://`). Clamped at zero.
-- `buffered`: `buffer_capacity - semaphore.available_permits()`.
+- `buffered`: `(current_cap + debt) - semaphore.available_permits()`. The
+  `+ debt` accounts for slots that have been forgotten from the semaphore
+  to honour an in-progress shrink but still hold a real in-flight item.
 
 Transitions:
 
@@ -262,7 +298,9 @@ see open questions).
    not interleave frames from different groups.
 3. **Permit conservation.** Every `Enqueued` consumes exactly one permit.
    Every dequeue, drop, or shutdown returns exactly one permit. There is
-   no "debt" or "force enqueue" path.
+   no "force enqueue" path. `set_buffer_capacity` may forget returned
+   permits (recording shortfall as `debt`) but never invents new ones —
+   `try_send` cannot observe a phantom slot.
 4. **Exactly-one report per Enqueued.** For each `try_send` that returns
    `Enqueued`, exactly one `DeliveryReport` is emitted to each subscriber
    that is alive at emission time. (`broadcast::Receiver::Lagged` is the
@@ -302,6 +340,16 @@ Required test coverage before this is considered done:
   unsent groups emit `Dropped(SinkShutdown)`, threads join.
 - **Concurrent senders:** N tasks each call `try_send` → permit count
   never exceeds `buffer_capacity`, no double-emit, no lost report.
+- **Runtime resize — validation:** `set_buffer_capacity(0)` → `Err`,
+  cap unchanged.
+- **Runtime resize — grow:** fill to original cap, observe drop; grow
+  past it; subsequent `try_send`s up to the new cap succeed.
+- **Runtime resize — shrink within occupancy:** with `M < N` items in
+  flight, shrink to a value above `M`; remaining headroom matches
+  `new_cap - M`; no debt persists.
+- **Runtime resize — shrink below occupancy:** shrink to less than
+  current occupancy; new sends rejected until a peer drains the buffer
+  and debt is paid down; then exactly `new_cap` slots reopen.
 
 ## Open questions
 
