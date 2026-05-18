@@ -119,6 +119,59 @@ pub enum EnqueueOutcome {
 // PushSink
 // ============================================================================
 
+/// Outbound side of the pump: a ZeroMQ PUSH socket fed by a bounded
+/// in-process buffer of multipart groups.
+///
+/// # What it does
+///
+/// [`try_send`](Self::try_send) hands a [`MultipartGroup`] to a worker
+/// thread that owns the underlying PUSH socket and writes every frame
+/// out with the right `SNDMORE` flags. Groups are atomic: either every
+/// frame reaches the socket or the whole group is dropped — never a
+/// half-sent group. Each accepted group eventually produces exactly one
+/// [`DeliveryReport`] on the [`delivery_reports`](Self::delivery_reports)
+/// broadcast channel, tagged with the caller's [`Seq`] so upstream can
+/// reconcile what made it through.
+///
+/// # Why it exists (and isn't just a raw PUSH socket)
+///
+/// Raw ZMQ PUSH has two properties that don't fit this pipeline:
+///
+/// 1. **No pre-connection buffering.** libzmq's send-side HWM only
+///    applies once a peer has connected; frames sent before that are
+///    dropped. The detector can start streaming at any time, so we need
+///    a startup pad that absorbs frames until a downstream consumer
+///    actually attaches.
+/// 2. **HWM-full and no-peer look identical to the sender.** A blocked
+///    `send` (or `EAGAIN` under `DONTWAIT`) doesn't tell you *why* —
+///    full peer buffer or no peer at all. That distinction matters here:
+///    pre-peer overflow is a startup-pad problem, peer-connected overflow
+///    is real backpressure, and they should be reported differently and
+///    may drive different policies upstream.
+///
+/// `PushSink` wraps the socket with a semaphore-bounded buffer in front
+/// and a `zmq_socket_monitor` PAIR socket behind, so peer count is
+/// always known. Drops are classified as
+/// [`PrefetchOverflow`](DropReason::PrefetchOverflow) (no peer yet) or
+/// [`BackpressureFull`](DropReason::BackpressureFull) (peer connected,
+/// can't keep up), and [`state`](Self::state) exposes the
+/// `WaitingForPeer` / `Streaming` distinction as a `watch` channel.
+///
+/// # Threading
+///
+/// Two `spawn_blocking` threads back each sink: a worker that owns the
+/// PUSH socket and runs a current-thread tokio runtime, and a monitor
+/// that reads connect/disconnect events off the inproc PAIR. The sync
+/// `zmq` crate is required (see [`PushSinkConfig`] docs and the
+/// `zmq-crate-constraint` note); these threads exist so blocking libzmq
+/// calls don't tie up the outer tokio runtime.
+///
+/// # Shutdown
+///
+/// Drop or [`shutdown`](Self::shutdown) cancels the worker. Any groups
+/// still in the buffer report
+/// [`Dropped(SinkShutdown)`](DropReason::SinkShutdown). `shutdown` awaits
+/// the worker threads; `Drop` just signals and lets them exit.
 pub struct PushSink {
     cancel: CancellationToken,
     tx: mpsc::UnboundedSender<WorkItem>,
@@ -134,8 +187,23 @@ pub struct PushSink {
 }
 
 impl PushSink {
-    /// Bind the PUSH socket, start the worker and monitor threads, and
-    /// return once the socket is bound (so [`port`](Self::port) is valid).
+    /// Bind a zmq PUSH socket, given buffering configuration
+    ///
+    /// Regardless of ZeroMQ HWM settings or whether the socket is being
+    /// actively drained by an external client, a minimum
+    /// `presocket_queue_length` items can be buffered inside the
+    /// [`PushSink`]. This quantity can be adjusted at run-time without
+    /// reopening the socket, upon which the number of queued messages can
+    /// exceed the buffer length.
+    ///
+    /// In addition to this buffer, the ZeroMQ socket itself will be set up
+    /// with a high water mark capacity, so the maximum number of messages that
+    /// can be buffered is `presocket_queue_length + zmq_send_hwm + 1`,
+    /// depending on whether the ZeroMQ socket is internally buffering (it does
+    /// not do this before being connected to, for instance).
+    ///
+    /// Returns once the socket is bound (so [`port`](Self::port) is valid),
+    /// and the worker threads have been started.
     pub async fn bind(endpoint: &str, config: PushSinkConfig) -> Result<Self> {
         config.validate()?;
 
