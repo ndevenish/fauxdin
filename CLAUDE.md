@@ -68,6 +68,13 @@ and `cargo check`. The sink tests bind ephemeral TCP ports and start
 blocking worker threads — they're real integration tests of `zmq` and
 take real time; expect a few seconds for the suite.
 
+## Commit after changes
+
+Once a change is working (build green, relevant tests pass), commit it.
+Don't leave the working tree dirty between turns — each logical change
+gets its own commit so the history stays bisectable. Follow the existing
+`area: short imperative` subject style (`sink: …`, `source: …`).
+
 The `epicars` and `gw-eiger` submodules are vendored dependencies; you
 don't normally need to build inside them.
 
