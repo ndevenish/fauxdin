@@ -92,9 +92,17 @@ def recv_some(conn: socket.socket, want: int, first_timeout: float,
     return buf
 
 
-def classify(raw: bytes) -> tuple[str, str]:
+def classify(raw: bytes, expected_version: int | None = None) -> tuple[str, str]:
     """Identify the ZMTP version from server greeting bytes.
-    Returns (status, detail)."""
+
+    `expected_version` is the version we asked the peer to speak (1, 2,
+    3, or None for the silent probe). It changes how we interpret byte
+    11 when byte 10 is 0x03: libzmq always writes byte 10 = 0x03
+    eagerly, before reading the peer's greeting, so a peer that
+    actually agreed on ZMTP/2.0 still sends a `\\x03` major byte —
+    followed by a socket-type byte rather than a v3 minor. Without the
+    context of what we sent, that looks like "ZMTP/3.8" or similar.
+    """
     if not raw:
         return "no data", "server closed or never wrote"
     if raw[0:1] != b"\xff":
@@ -108,6 +116,19 @@ def classify(raw: bytes) -> tuple[str, str]:
     if len(raw) < 11:
         return "ZMTP/2.0+", "signature only (revision byte withheld — peer is waiting on us)"
     rev = raw[10]
+    # libzmq quirk: when downgrading to v2.0 it still writes byte 10 = 0x03
+    # because that byte goes out before it has read our greeting. If we
+    # explicitly asked for v2.0, the next byte is the socket-type, not a
+    # v3 minor.
+    if expected_version == 2 and rev == 0x03:
+        if len(raw) < 12:
+            return "ZMTP/2.0", "downgrade (peer wrote major=3 eagerly; socket-type withheld)"
+        st = raw[11]
+        return (
+            "ZMTP/2.0",
+            f"socket-type={st}={_V2_SOCKET_TYPES.get(st, '?')} "
+            f"(peer wrote major=3 byte eagerly — libzmq quirk)",
+        )
     if rev == 0x01:
         if len(raw) < 12:
             return "ZMTP/2.0", "revision=1 (socket-type withheld)"
@@ -130,6 +151,7 @@ def probe(
     port: int,
     label: str,
     greeting: bytes,
+    expected_version: int | None,
     connect_timeout: float,
     read_timeout: float,
     read_max: int = 64,
@@ -147,7 +169,7 @@ def probe(
             except OSError as e:
                 return ProbeResult(label=label, status=f"send failed: {e}")
         raw = recv_some(s, read_max, first_timeout=read_timeout)
-        status, detail = classify(raw)
+        status, detail = classify(raw, expected_version=expected_version)
         return ProbeResult(label=label, status=status, detail=detail, raw=raw)
     finally:
         try:
@@ -184,20 +206,20 @@ def main(argv=None) -> int:
     )
     args = ap.parse_args(argv)
 
-    probes: list[tuple[str, bytes, float]] = [
-        ("silent", b"", args.silent_timeout),
+    probes: list[tuple[str, bytes, int | None, float]] = [
+        ("silent", b"", None, args.silent_timeout),
     ]
     if args.probe_all:
         probes.extend([
-            ("send v1", V1_GREETING, args.probe_timeout),
-            ("send v2", V2_GREETING, args.probe_timeout),
-            ("send v3", V3_GREETING, args.probe_timeout),
+            ("send v1", V1_GREETING, 1, args.probe_timeout),
+            ("send v2", V2_GREETING, 2, args.probe_timeout),
+            ("send v3", V3_GREETING, 3, args.probe_timeout),
         ])
 
     print(f"{args.host}:{args.port} probe results:")
-    width = max(len(label) for label, _, _ in probes)
-    for label, greeting, read_to in probes:
-        r = probe(args.host, args.port, label, greeting,
+    width = max(len(label) for label, _, _, _ in probes)
+    for label, greeting, expected, read_to in probes:
+        r = probe(args.host, args.port, label, greeting, expected,
                   args.connect_timeout, read_to)
         print(f"  {label:<{width}} → {r.format()}")
     return 0
