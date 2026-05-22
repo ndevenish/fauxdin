@@ -2,23 +2,25 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""ZMTP/1.0 PUSH server for testing client-library compatibility.
+"""ZMTP/2.0 PUSH server for testing client-library compatibility.
 
-Speaks raw ZMTP/1.0 on the wire — deliberately not via pyzmq, which uses
+Speaks raw ZMTP/2.0 on the wire — deliberately not via pyzmq, which uses
 whatever libzmq it links against (usually 4.x / ZMTP 3.x).
 
 Per connection:
 
-  1. Sends a ZMTP/1.0 greeting: an anonymous identity frame (`\\x01\\x00`).
+  1. Sends a ZMTP/2.0 greeting: signature (`\\xff <8 zeros> \\x7f`),
+     revision=1, socket-type=PUSH (8), followed by an empty (anonymous)
+     identity frame in v2 framing.
   2. Reads enough bytes from the client to identify what ZMTP version it
-     was trying to negotiate, and logs it. Anything other than 1.0 is
+     was trying to negotiate, and logs it. Anything other than 2.0 is
      warned about — that is the question this script exists to answer.
   3. Pushes frames. Default payload is 256 single-frame messages of 512
      bytes each, body filled with byte N for N in 0..255. 512 is well
-     past the v1 short/long length boundary (254), so every frame
-     exercises the long-length encoding.
+     past the v2 short/long length boundary (255), so every frame
+     exercises the long-length encoding (LONG flag set).
 
-Always speaks 1.0 in both directions, regardless of what the peer claims.
+Always speaks 2.0 in both directions, regardless of what the peer claims.
 Whether the client gracefully downgrades is part of what we're testing.
 """
 
@@ -35,19 +37,32 @@ from dataclasses import dataclass
 
 LOG = logging.getLogger("megamind")
 
-# ZMTP/1.0 frame: length + flags + body
-#   length: 1 byte if < 255, else 0xff + 8-byte big-endian uint64
-#   length includes the flags byte, so body of N bytes ⇒ length = N + 1
-#   flags byte: bit 0 = MORE
+# ZMTP/2.0 frame: flags + length + body
+#   flags byte: bit 0 = MORE, bit 1 = LONG
+#   length: 1 byte if body ≤ 255 (LONG clear); else 8 bytes big-endian (LONG set)
+#   length is the BODY length only — does NOT include the flags byte
+#   (this is the key difference from ZMTP/1.0, where length included flags)
 FLAG_MORE = 0x01
+FLAG_LONG = 0x02
+
+# ZMTP/2.0 greeting:
+#   signature (10 bytes): \xff <8 zero bytes> \x7f
+#   revision (1 byte):    \x01
+#   socket-type (1 byte): 0x08 = PUSH
+GREETING_V2 = (
+    b"\xff" + b"\x00" * 8 + b"\x7f"
+    + b"\x01"
+    + b"\x08"
+)
+assert len(GREETING_V2) == 12, len(GREETING_V2)
 
 
-def encode_v1_frame(body: bytes, more: bool = False) -> bytes:
+def encode_v2_frame(body: bytes, more: bool = False) -> bytes:
     flags = FLAG_MORE if more else 0x00
-    length = len(body) + 1
-    if length < 0xFF:
-        return bytes([length, flags]) + body
-    return b"\xff" + struct.pack(">Q", length) + bytes([flags]) + body
+    if len(body) > 255:
+        flags |= FLAG_LONG
+        return bytes([flags]) + struct.pack(">Q", len(body)) + body
+    return bytes([flags, len(body)]) + body
 
 
 @dataclass
@@ -78,7 +93,7 @@ def detect_peer_version(conn: socket.socket) -> PeerInfo:
     Anything else is 1.0. We read only as many bytes as needed to
     classify; the rest of the peer's handshake (if any) is left in the
     socket — we don't care about it, since we're going to keep speaking
-    1.0 regardless.
+    2.0 regardless.
     """
     b0 = recv_exact(conn, 1)
     if b0 != b"\xff":
@@ -110,17 +125,19 @@ def serve_client(
 ) -> None:
     LOG.info("[%s] connected", addr)
     try:
-        greeting = encode_v1_frame(b"", more=False)
-        conn.sendall(greeting)
-        LOG.debug("[%s] sent v1 greeting: %s", addr, greeting.hex())
+        conn.sendall(GREETING_V2)
+        LOG.debug("[%s] sent v2.0 greeting: %s", addr, GREETING_V2.hex())
+        identity = encode_v2_frame(b"", more=False)
+        conn.sendall(identity)
+        LOG.debug("[%s] sent empty identity frame: %s", addr, identity.hex())
 
         peer = detect_peer_version(conn)
-        level = logging.INFO if peer.label.startswith("ZMTP/1.0") else logging.WARNING
+        level = logging.INFO if peer.label.startswith("ZMTP/2.0") else logging.WARNING
         LOG.log(level, "[%s] peer attempted %s", addr, peer)
 
         sent = 0
         for body in default_payloads(frame_size):
-            frame = encode_v1_frame(body, more=False)
+            frame = encode_v2_frame(body, more=False)
             try:
                 conn.sendall(frame)
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
@@ -166,8 +183,8 @@ def main(argv=None) -> int:
         "--frame-size",
         type=int,
         default=512,
-        help="bytes per frame body (default: 512 — past the v1 "
-        "short-length cutoff of 254 so every frame is long-encoded)",
+        help="bytes per frame body (default: 512 — past the v2 "
+        "short-length cutoff of 255 so every frame is long-encoded)",
     )
     ap.add_argument(
         "--interval",
@@ -210,7 +227,7 @@ def main(argv=None) -> int:
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((args.bind, args.port))
     srv.listen(8)
-    LOG.warning("listening on %s:%d (ZMTP/1.0 PUSH)", args.bind, args.port)
+    LOG.warning("listening on %s:%d (ZMTP/2.0 PUSH)", args.bind, args.port)
 
     try:
         while True:
