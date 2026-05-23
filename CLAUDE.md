@@ -46,16 +46,18 @@ accidentally violate:
 - **Mirror and capture are independent subscribers** with different drop
   policies (`DropNewest` for sink, `NeverDrop` for capture). Capture
   errors **never** mutate lifecycle state.
-- **Async-native `rzmq` (vendored at `rzmq/`).** The connect side
-  negotiates a ZMTP/2.0 downgrade for legacy Eiger detectors; see
-  `rzmq/rzmq-v2-plan.md`. fauxdin pins the vendored copy via `path = "./rzmq/core"`
-  rather than the crates.io release. All ZMQ I/O is plain `tokio::spawn`
-  tasks — no `spawn_blocking` in the hot path. **Don't set `SNDTIMEO = 0`
-  on an rzmq socket**: it propagates to the session's TCP `write_all`
-  timeout (`sessionx/protocol_handler/data_io.rs`), so any peer that can't
-  drain at line rate becomes a fatal session error. Leave it at the
-  default and rely on the front buffer + the cancel token for backpressure
-  and shutdown.
+- **Async-native `rzmq` (crates.io, 0.5.x).** All ZMQ I/O is plain
+  `tokio::spawn` tasks — no `spawn_blocking` in the hot path. A local
+  working copy at `./rzmq/` (gitignored) carries WIP ZMTP/2.0 downgrade
+  work needed for legacy Eiger detectors; switch the `rzmq` dep over to
+  `path = "./rzmq/core"` when running against real v2-only peers. The
+  crates.io release is fine for testing against modern libzmq (v3.1)
+  peers. **Don't set `SNDTIMEO = 0` on an rzmq socket**: it propagates
+  to the session's TCP `write_all` timeout (in
+  `sessionx/protocol_handler/data_io.rs`), so any peer that can't drain
+  at line rate becomes a fatal session error. Leave it at the default
+  and rely on the front buffer + the cancel token for backpressure and
+  shutdown.
 - **`Bytes` for frame storage.** `tokio_util::bytes::Bytes` — one copy at
   the PULL read, `Arc`-cloned everywhere after.
 

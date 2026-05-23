@@ -17,11 +17,11 @@ the API).
 
 ## Constraints
 
-- Async-native `rzmq` (vendored under `rzmq/`). The connect side speaks
-  ZMTP/3.1 with a ZMTP/2.0 downgrade negotiation for legacy peers (Eiger
-  detectors, libzmq 3.x), which is why fauxdin pins the vendored copy
-  rather than the crates.io release — `rzmq-v2-plan.md` in the submodule
-  has the full story.
+- Async-native `rzmq` from crates.io (0.5.x). Modern libzmq (v3.1) peers
+  work against the published release. A local working copy at `./rzmq/`
+  (gitignored) carries WIP ZMTP/2.0 downgrade work for legacy Eiger
+  detectors — switch the dep to `path = "./rzmq/core"` when running
+  against v2-only peers.
 - The PUSH socket and its monitor live in tokio tasks; no `spawn_blocking`
   is used in the hot path.
 - Multipart groups are atomic — the sink either sends all frames of a group

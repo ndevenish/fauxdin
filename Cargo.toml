@@ -10,7 +10,7 @@ anyhow = "1.0.100"
 clap = { version = "4.5.50", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing = "0.1.41"
-rzmq = { path = "./rzmq/core" }
+rzmq = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio-util = "0.7.16"
 console-subscriber = "0.5.0"

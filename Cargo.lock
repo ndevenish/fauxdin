@@ -2066,6 +2066,8 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "rzmq"
 version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5136596a053e29e0ae1c1f01c5062ad022203abbbb264d86035b79bde037bd5e"
 dependencies = [
  "async-recursion",
  "async-trait",
