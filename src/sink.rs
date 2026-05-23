@@ -472,11 +472,9 @@ struct Worker {
     permits: Arc<Semaphore>,
     reports: broadcast::Sender<DeliveryReport>,
     state_tx: watch::Sender<SinkState>,
-    /// rzmq's monitor channel. `recv(&self)` returns a cancel-safe future,
-    /// so we `select!` on it directly. Set to `None` once the channel
-    /// closes (which happens when the socket actor is torn down) so the
-    /// select loop drops the monitor arm and doesn't busy-loop on a
-    /// terminal `Err`.
+    /// `None` once the channel closes (which happens when the socket
+    /// actor is torn down), so the select loop drops the monitor arm and
+    /// doesn't busy-loop on a terminal `Err`.
     monitor_rx: Option<MonitorReceiver>,
     outbox: mpsc::UnboundedReceiver<WorkItem>,
     peers_atomic: Arc<AtomicUsize>,
@@ -594,9 +592,7 @@ impl Worker {
 
         // With SNDTIMEO unset, `send_multipart` blocks until the peer is
         // connected and has accepted every frame, or returns
-        // `HostUnreachable` if the chosen peer was lost mid-send. The send
-        // future is cancel-safe (single mailbox + oneshot), so racing it
-        // against the cancellation token is sound.
+        // `HostUnreachable` if the chosen peer was lost mid-send.
         let cancel = self.cancel.clone();
         let res = tokio::select! {
             biased;
