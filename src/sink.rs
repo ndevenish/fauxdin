@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use rzmq::socket::options as zmq_opts;
@@ -42,13 +41,6 @@ pub struct PushSinkConfig {
     /// for instance). A value of zero or less is rejected — if you truly
     /// want an unlimited buffer, this socket wrapper is unnecessary.
     pub zmq_send_hwm: i32,
-    /// Reserved for future use. The current implementation does not poll
-    /// or retry — the worker awaits `send_multipart` (which blocks until
-    /// the peer is connected and accepts the message) and races it only
-    /// against [`Self::cancel`]. The field is kept on the public config so
-    /// callers that have it set don't need to change, and so a future
-    /// timeout-based variant can wire it back in without an API break.
-    pub send_retry_interval: Duration,
     /// Cancellation token. The sink clones this and stores it; cancelling it
     /// (from anywhere) drains the buffer and stops the worker, identically to
     /// calling [`PushSink::shutdown`]. Default: a fresh token owned only by
@@ -62,7 +54,6 @@ impl Default for PushSinkConfig {
         Self {
             buffer_capacity: 500,
             zmq_send_hwm: 50,
-            send_retry_interval: Duration::from_millis(50),
             cancel: CancellationToken::new(),
         }
     }
@@ -716,7 +707,7 @@ fn apply_cap_change(
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tokio_util::bytes::Bytes;
 
     fn group(frames: &[&[u8]]) -> Arc<MultipartGroup> {
@@ -731,7 +722,6 @@ mod tests {
         PushSinkConfig {
             buffer_capacity: 10,
             zmq_send_hwm: 2,
-            send_retry_interval: Duration::from_millis(10),
             cancel: CancellationToken::new(),
         }
     }
@@ -974,7 +964,6 @@ mod tests {
         let cfg = PushSinkConfig {
             buffer_capacity: 5,
             zmq_send_hwm: 1,
-            send_retry_interval: Duration::from_millis(5),
             ..test_config()
         };
         let sink = PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap();
@@ -1115,30 +1104,19 @@ mod tests {
 
     #[tokio::test]
     async fn try_send_after_shutdown_returns_shutting_down() {
+        // `shutdown` consumes self, so to exercise post-shutdown `try_send`
+        // we share the sink's internals with a `PushSinkForTest` stand-in
+        // that mirrors `try_send`'s logic, flip `shutting_down` by hand,
+        // and check the stand-in returns `ShuttingDown`.
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
-        // We can't call shutdown(self) and then try_send. Instead, set the
-        // flag manually via Drop semantics: keep a clone of the cancel token
-        // by holding a state receiver alive, drop the sink, see that
-        // queueing fails. We instead exercise the path by spawning shutdown
-        // concurrently with try_send.
-        let cancel = sink.cancel.clone();
-        let shutting_down = sink.shutting_down.clone();
-        let tx = sink.tx.clone();
-        let permits = sink.permits.clone();
-        let peers = sink.peers.clone();
-        // Cancel the worker; mark shutting_down. Then make a fake PushSink
-        // pointing at the same internals — the public API is what we test.
-        cancel.cancel();
-        shutting_down.store(true, Ordering::Release);
-        // We can't reconstruct a PushSink from the outside, but we don't
-        // need to: try_send only consults shutting_down + permits + tx.
-        // Build a synthetic sink for the API call.
         let fake = PushSinkForTest {
-            tx,
-            permits,
-            peers,
-            shutting_down,
+            tx: sink.tx.clone(),
+            permits: sink.permits.clone(),
+            peers: sink.peers.clone(),
+            shutting_down: sink.shutting_down.clone(),
         };
+        sink.cancel.cancel();
+        sink.shutting_down.store(true, Ordering::Release);
         let r = fake.try_send(0, group(&[b"x"]));
         assert_eq!(r, EnqueueOutcome::ShuttingDown);
         sink.shutdown().await;
@@ -1268,7 +1246,6 @@ mod tests {
         let cfg = PushSinkConfig {
             buffer_capacity: 10,
             zmq_send_hwm: 1,
-            send_retry_interval: Duration::from_millis(5),
             ..test_config()
         };
         let sink = PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap();
@@ -1336,7 +1313,6 @@ mod tests {
         let cfg = PushSinkConfig {
             buffer_capacity: 20,
             zmq_send_hwm: 5,
-            send_retry_interval: Duration::from_millis(5),
             ..test_config()
         };
         let sink = Arc::new(PushSink::bind(TEST_ENDPOINT, cfg).await.unwrap());

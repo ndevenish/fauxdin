@@ -37,13 +37,6 @@ pub struct PushSinkConfig {
     pub buffer_capacity: usize,
     /// ZMQ_SNDHWM applied to the PUSH socket. Must be > 0.
     pub zmq_send_hwm: i32,
-    /// Reserved for future use. The current rzmq-based worker awaits
-    /// `Socket::send_multipart` (which blocks until the peer is connected
-    /// and accepts the message) and races it against the cancellation
-    /// token; there is no retry loop today. Kept on the public config so
-    /// future timeout-based variants can wire it back in without an API
-    /// break.
-    pub send_retry_interval: Duration,
     /// Cancellation token. Cancelling it (from anywhere) drains the buffer
     /// and stops the worker, identical to calling `shutdown()`. Default: a
     /// fresh token. Pass a child of a parent pipeline token when wiring
