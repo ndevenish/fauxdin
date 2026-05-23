@@ -157,13 +157,14 @@ pub enum EnqueueOutcome {
 ///
 /// # Threading
 ///
-/// The sink is fully tokio-native — three async tasks back it:
+/// The sink is fully tokio-native — two async tasks back it:
 ///
-/// 1. A worker (`tokio::spawn`) owning the rzmq PUSH socket; runs the
-///    send loop and updates `SinkState`.
-/// 2. A monitor forwarder (`tokio::spawn`) bridging the rzmq monitor
-///    channel (a `fibre` MPMC) into a tokio `mpsc` the worker selects on.
-/// 3. A capacity task (`tokio::spawn`) that reconciles `current_cap` /
+/// 1. A worker (`tokio::spawn`) owning the rzmq PUSH socket and its
+///    monitor receiver; runs the send loop and updates `SinkState`. The
+///    monitor is a `fibre` MPMC channel whose `recv(&self)` future is
+///    cancel-safe, so the worker `select!`s on it directly — no
+///    forwarding shim is needed.
+/// 2. A capacity task (`tokio::spawn`) that reconciles `current_cap` /
 ///    `debt` with the shared semaphore on `set_buffer_capacity`.
 ///
 /// # Shutdown
@@ -181,7 +182,6 @@ pub struct PushSink {
     state_rx: watch::Receiver<SinkState>,
     reports_tx: broadcast::Sender<DeliveryReport>,
     worker: Option<JoinHandle<()>>,
-    monitor_forwarder: Option<JoinHandle<()>>,
     capacity: Option<JoinHandle<()>>,
     port: Option<u16>,
     /// Currently-effective buffer capacity. Driven by the capacity task in
@@ -277,11 +277,7 @@ impl PushSink {
         let (tx, outbox_rx) = mpsc::unbounded_channel::<WorkItem>();
         let (reports_tx, _) = broadcast::channel(DELIVERY_BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(SinkState::WaitingForPeer { buffered: 0 });
-        let (mon_tx, mon_rx) = mpsc::unbounded_channel::<SocketEvent>();
         let (cap_tx, cap_rx) = watch::channel(config.buffer_capacity);
-
-        let monitor_forwarder =
-            tokio::spawn(monitor_forwarder_main(rzmq_monitor, mon_tx, cancel.clone()));
 
         let worker = {
             let socket = socket.clone();
@@ -301,7 +297,7 @@ impl PushSink {
                     permits,
                     reports,
                     state_tx,
-                    monitor_rx: Some(mon_rx),
+                    monitor_rx: Some(rzmq_monitor),
                     outbox: outbox_rx,
                     peers_atomic: peers,
                     shutting_down,
@@ -331,7 +327,6 @@ impl PushSink {
             state_rx,
             reports_tx,
             worker: Some(worker),
-            monitor_forwarder: Some(monitor_forwarder),
             capacity: Some(capacity),
             port,
             current_cap,
@@ -417,9 +412,6 @@ impl PushSink {
         if let Some(h) = self.worker.take() {
             let _ = h.await;
         }
-        if let Some(h) = self.monitor_forwarder.take() {
-            let _ = h.await;
-        }
         if let Some(h) = self.capacity.take() {
             let _ = h.await;
         }
@@ -476,33 +468,6 @@ fn state_significantly_differs(a: &SinkState, b: &SinkState) -> bool {
     }
 }
 
-/// Bridge the rzmq monitor receiver (a `fibre` MPMC) into a tokio mpsc the
-/// worker can `select!` on directly. Exits when the monitor closes or on
-/// cancellation.
-async fn monitor_forwarder_main(
-    rzmq_monitor: MonitorReceiver,
-    tx: mpsc::UnboundedSender<SocketEvent>,
-    cancel: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            res = rzmq_monitor.recv() => {
-                match res {
-                    Ok(ev) => {
-                        if tx.send(ev).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-    debug!("sink monitor forwarder exiting");
-}
-
 struct Worker {
     config: PushSinkConfig,
     socket: Socket,
@@ -510,10 +475,12 @@ struct Worker {
     permits: Arc<Semaphore>,
     reports: broadcast::Sender<DeliveryReport>,
     state_tx: watch::Sender<SinkState>,
-    /// `None` once the monitor forwarder has exited. Allows the main select
-    /// loop to drop the monitor arm and avoid busy-looping on a closed
-    /// receiver.
-    monitor_rx: Option<mpsc::UnboundedReceiver<SocketEvent>>,
+    /// rzmq's monitor channel. `recv(&self)` returns a cancel-safe future,
+    /// so we `select!` on it directly. Set to `None` once the channel
+    /// closes (which happens when the socket actor is torn down) so the
+    /// select loop drops the monitor arm and doesn't busy-loop on a
+    /// terminal `Err`.
+    monitor_rx: Option<MonitorReceiver>,
     outbox: mpsc::UnboundedReceiver<WorkItem>,
     peers_atomic: Arc<AtomicUsize>,
     shutting_down: Arc<AtomicBool>,
@@ -533,14 +500,14 @@ impl Worker {
     async fn run(mut self) {
         loop {
             let cancel = self.cancel.clone();
-            let action = match self.monitor_rx.as_mut() {
+            let action = match self.monitor_rx.as_ref() {
                 Some(mon_rx) => {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => WorkerAction::Break,
                         ev = mon_rx.recv() => match ev {
-                            Some(e) => WorkerAction::Monitor(e),
-                            None => WorkerAction::MonitorClosed,
+                            Ok(e) => WorkerAction::Monitor(e),
+                            Err(_) => WorkerAction::MonitorClosed,
                         },
                         work = self.outbox.recv() => match work {
                             Some(w) => WorkerAction::Work(w),

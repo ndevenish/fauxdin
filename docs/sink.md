@@ -165,20 +165,24 @@ async caller ──try_send──→ outbox (mpsc::UnboundedSender + Semaphore)
         │                                                         │
         │  owns:                                                  │
         │    - rzmq::Socket (PUSH; cloneable handle)              │
-        │    - tokio mpsc bridge from the rzmq monitor channel    │
+        │    - rzmq MonitorReceiver (fibre MPMC; selected on      │
+        │      directly via its cancel-safe recv(&self))          │
         │    - peer_count: usize (local; reflected to state)      │
         │    - buffered: derived from semaphore                   │
         └─────────────────────────────────────────────────────────┘
 ```
 
-Three concurrent tasks in total — all `tokio::spawn`, no `spawn_blocking`:
+Two concurrent tasks in total — both `tokio::spawn`, no `spawn_blocking`:
 
-1. **Worker** owns the PUSH socket. Drives the send loop. Updates
-   `SinkState`.
-2. **Monitor forwarder** bridges rzmq's monitor receiver (a `fibre` MPMC)
-   into a tokio `mpsc::UnboundedReceiver<SocketEvent>` that the worker can
-   `select!` on directly. Exits when the monitor closes.
-3. **Capacity task** listens on a `watch::Receiver<usize>` and reconciles
+1. **Worker** owns the PUSH socket and its monitor receiver. Drives the
+   send loop. Updates `SinkState`. The monitor lives on the worker
+   because nothing outside the worker observes peer events; its
+   `fibre::mpmc::AsyncReceiver::recv(&self)` future is cancel-safe, so a
+   `tokio::select!` arm can poll it directly. The receiver is held in an
+   `Option<MonitorReceiver>` so that, once the channel closes (the rzmq
+   socket actor has torn down), the worker drops the monitor arm from
+   subsequent selects and doesn't busy-loop on a terminal `Err`.
+2. **Capacity task** listens on a `watch::Receiver<usize>` and reconciles
    `current_cap` / `debt` with the shared semaphore. Does not touch the
    socket or `state`.
 
