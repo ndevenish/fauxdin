@@ -165,8 +165,7 @@ async caller ──try_send──→ outbox (mpsc::UnboundedSender + Semaphore)
         │                                                         │
         │  owns:                                                  │
         │    - rzmq::Socket (PUSH; cloneable handle)              │
-        │    - rzmq MonitorReceiver (fibre MPMC; selected on      │
-        │      directly via its cancel-safe recv(&self))          │
+        │    - rzmq MonitorReceiver                               │
         │    - peer_count: usize (local; reflected to state)      │
         │    - buffered: derived from semaphore                   │
         └─────────────────────────────────────────────────────────┘
@@ -175,13 +174,10 @@ async caller ──try_send──→ outbox (mpsc::UnboundedSender + Semaphore)
 Two concurrent tasks in total — both `tokio::spawn`, no `spawn_blocking`:
 
 1. **Worker** owns the PUSH socket and its monitor receiver. Drives the
-   send loop. Updates `SinkState`. The monitor lives on the worker
-   because nothing outside the worker observes peer events; its
-   `fibre::mpmc::AsyncReceiver::recv(&self)` future is cancel-safe, so a
-   `tokio::select!` arm can poll it directly. The receiver is held in an
-   `Option<MonitorReceiver>` so that, once the channel closes (the rzmq
-   socket actor has torn down), the worker drops the monitor arm from
-   subsequent selects and doesn't busy-loop on a terminal `Err`.
+   send loop. Updates `SinkState`. The receiver is held as
+   `Option<MonitorReceiver>` so that, once the channel closes during
+   socket teardown, the worker drops the monitor arm from subsequent
+   selects instead of busy-looping on a terminal `Err`.
 2. **Capacity task** listens on a `watch::Receiver<usize>` and reconciles
    `current_cap` / `debt` with the shared semaphore. Does not touch the
    socket or `state`.
@@ -284,10 +280,9 @@ slow peer into a fatal session error and tears the connection down.
 1. Cancel the worker's cancellation token.
 2. Worker stops calling `outbox.recv()`, drains remaining messages with
    `try_recv`, emits `Dropped(SinkShutdown)` for each, exits.
-3. Monitor forwarder exits when the rzmq monitor channel closes (it closes
-   when the socket's actor is torn down).
-4. `shutdown()` joins all three tasks, calls `socket.close().await`, then
-   `Context::term().await` to drain any remaining rzmq actors.
+3. `shutdown()` joins the worker and capacity tasks, calls
+   `socket.close().await`, then `Context::term().await` to drain any
+   remaining rzmq actors.
 
 `Drop` on `PushSink` cancels the token but does not await join or call
 `ctx.term()`. Use `shutdown()` for clean exit; use `Drop` for panics.

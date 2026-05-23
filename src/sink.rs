@@ -160,10 +160,7 @@ pub enum EnqueueOutcome {
 /// The sink is fully tokio-native — two async tasks back it:
 ///
 /// 1. A worker (`tokio::spawn`) owning the rzmq PUSH socket and its
-///    monitor receiver; runs the send loop and updates `SinkState`. The
-///    monitor is a `fibre` MPMC channel whose `recv(&self)` future is
-///    cancel-safe, so the worker `select!`s on it directly — no
-///    forwarding shim is needed.
+///    monitor receiver; runs the send loop and updates `SinkState`.
 /// 2. A capacity task (`tokio::spawn`) that reconciles `current_cap` /
 ///    `debt` with the shared semaphore on `set_buffer_capacity`.
 ///
