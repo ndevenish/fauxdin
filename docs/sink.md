@@ -17,10 +17,13 @@ the API).
 
 ## Constraints
 
-- Synchronous `zmq = "0.10"` crate (libzmq binding). `rzmq` is not viable —
-  it doesn't support the ZeroMQ protocol versions the detector speaks.
-- The PUSH socket and its monitor must run on a dedicated OS thread; the
-  rest of the type is async (tokio).
+- Async-native `rzmq` (vendored under `rzmq/`). The connect side speaks
+  ZMTP/3.1 with a ZMTP/2.0 downgrade negotiation for legacy peers (Eiger
+  detectors, libzmq 3.x), which is why fauxdin pins the vendored copy
+  rather than the crates.io release — `rzmq-v2-plan.md` in the submodule
+  has the full story.
+- The PUSH socket and its monitor live in tokio tasks; no `spawn_blocking`
+  is used in the hot path.
 - Multipart groups are atomic — the sink either sends all frames of a group
   with correct `SNDMORE` flags or drops the whole group.
 
@@ -34,14 +37,13 @@ pub struct PushSinkConfig {
     pub buffer_capacity: usize,
     /// ZMQ_SNDHWM applied to the PUSH socket. Must be > 0.
     pub zmq_send_hwm: i32,
-    /// Backoff between retries when libzmq returns `EAGAIN` on `send`.
-    /// The worker sends with `DONTWAIT` so it stays reactive to cancel
-    /// and peer-monitor events; on `EAGAIN` it sleeps this interval
-    /// before retrying, also waking on cancel or peer disconnect during
-    /// the sleep. The sync `zmq` crate has no POLLOUT-style hook that
-    /// composes with tokio, so a timed retry is the pragmatic
-    /// alternative — adds at most one interval of latency per retry.
-    pub send_retry_interval: Duration,  // e.g. 50ms
+    /// Reserved for future use. The current rzmq-based worker awaits
+    /// `Socket::send_multipart` (which blocks until the peer is connected
+    /// and accepts the message) and races it against the cancellation
+    /// token; there is no retry loop today. Kept on the public config so
+    /// future timeout-based variants can wire it back in without an API
+    /// break.
+    pub send_retry_interval: Duration,
     /// Cancellation token. Cancelling it (from anywhere) drains the buffer
     /// and stops the worker, identical to calling `shutdown()`. Default: a
     /// fresh token. Pass a child of a parent pipeline token when wiring
@@ -155,34 +157,30 @@ frame.
 async caller ──try_send──→ outbox (mpsc::UnboundedSender + Semaphore)
                                     │
                                     ▼
-        ┌───────────────────── worker thread ─────────────────────┐
-        │  current-thread tokio runtime selects over:             │
+        ┌───────────────────── worker task ───────────────────────┐
+        │  tokio::spawn selects over:                             │
         │    - outbox.recv()         (new groups to send)         │
         │    - monitor_rx.recv()     (peer connect/disconnect)    │
         │    - cancel.cancelled()    (shutdown)                   │
         │                                                         │
         │  owns:                                                  │
-        │    - zmq::Socket (PUSH)                                 │
-        │    - zmq::Socket (PAIR, reading socket_monitor events)  │
+        │    - rzmq::Socket (PUSH; cloneable handle)              │
+        │    - tokio mpsc bridge from the rzmq monitor channel    │
         │    - peer_count: usize (local; reflected to state)      │
         │    - buffered: derived from semaphore                   │
         └─────────────────────────────────────────────────────────┘
 ```
 
-Three concurrent components in total:
+Three concurrent tasks in total — all `tokio::spawn`, no `spawn_blocking`:
 
-1. **Worker thread** (`spawn_blocking` running a current-thread runtime).
-   Owns the PUSH socket. Drives the send loop. Updates `SinkState`.
-2. **Monitor reader** (`spawn_blocking` with a plain loop). Opens the
-   inproc PAIR for `zmq_socket_monitor` and forwards parsed events into a
-   tokio `mpsc` consumed by the worker.
-3. **Capacity task** (`tokio::spawn`, pure async). Listens on a
-   `watch::Receiver<usize>` and reconciles `current_cap` / `debt` with the
-   shared semaphore. Does not touch the socket or `state`.
-
-The monitor reader is its own thread because libzmq's monitor PAIR is read
-synchronously, and we don't want to interleave it with the send loop. It's
-small and dies on socket close.
+1. **Worker** owns the PUSH socket. Drives the send loop. Updates
+   `SinkState`.
+2. **Monitor forwarder** bridges rzmq's monitor receiver (a `fibre` MPMC)
+   into a tokio `mpsc::UnboundedReceiver<SocketEvent>` that the worker can
+   `select!` on directly. Exits when the monitor closes.
+3. **Capacity task** listens on a `watch::Receiver<usize>` and reconciles
+   `current_cap` / `debt` with the shared semaphore. Does not touch the
+   socket or `state`.
 
 ### Buffer / permit accounting
 
@@ -257,22 +255,23 @@ DeliveryReports.
 
 For each `(seq, group, permit)` pulled from the outbox:
 
-1. For each frame `f` in the group except the last:
-   `socket.send(f, DONTWAIT | SNDMORE)`. On `EAGAIN`, sleep
-   `send_retry_interval` and retry. On other error, abort this group, emit
-   `SendError`, drop permit. **Never panic.**
-2. For the last frame: same, without `SNDMORE`.
-3. If all frames sent: emit `Delivered(seq)`, drop permit.
-4. If cancelled mid-group: emit `Dropped(SinkShutdown)`, drop permit.
-   (Note: this may leave a partial multipart on the wire from libzmq's
-   perspective. ZMQ documents that closing a PUSH socket mid-multipart
-   discards the partial; we rely on that.)
+1. Reassemble the stored `Bytes` frames into a `Vec<rzmq::Msg>` (cheap —
+   `Bytes::clone` is a refcount bump).
+2. Call `socket.send_multipart(frames).await`, racing it against
+   `cancel.cancelled()`. The send future is cancel-safe per rzmq's
+   contract: dropping it does not corrupt the actor's state.
+3. `Ok(())`: emit `Delivered(seq)`, drop permit.
+4. `Err(_)`: emit `SendError(e)`, drop permit. **Never panic.**
+5. Cancellation: emit `Dropped(SinkShutdown)`, drop permit.
 
-`EAGAIN` retry has no hard cap in v1. A peer that disconnects mid-group
-will produce DISCONNECTED on the monitor; the send loop checks
-`peer_count == 0` between retries and, if so, drops the in-flight group
-with `Dropped(BackpressureFull)` (or a dedicated `PeerLost` variant — TBD,
-see open questions).
+`SNDTIMEO` is left at its default (`None`) so `send_multipart` blocks the
+worker until the peer is connected and has accepted every frame. The
+worker holds its permit for the duration, so a slow or absent peer
+naturally fills the front buffer and surfaces drop reasons to `try_send`
+without ever queueing a partial multipart on the wire. **Do not set
+`SNDTIMEO = 0`**: rzmq propagates the same value to the session's TCP
+`write_all` timeout, and a zero-duration write timeout converts every
+slow peer into a fatal session error and tears the connection down.
 
 ### Shutdown
 
@@ -280,13 +279,14 @@ see open questions).
 
 1. Cancel the worker's cancellation token.
 2. Worker stops calling `outbox.recv()`, drains remaining messages with
-   `try_recv`, emits `Dropped(SinkShutdown)` for each, closes both
-   sockets, exits.
-3. Monitor reader thread exits when its PAIR socket closes.
-4. `shutdown()` future joins both threads and resolves.
+   `try_recv`, emits `Dropped(SinkShutdown)` for each, exits.
+3. Monitor forwarder exits when the rzmq monitor channel closes (it closes
+   when the socket's actor is torn down).
+4. `shutdown()` joins all three tasks, calls `socket.close().await`, then
+   `Context::term().await` to drain any remaining rzmq actors.
 
-`Drop` on `PushSink` cancels the token but does not await join. Use
-`shutdown()` for clean exit; use `Drop` for panics.
+`Drop` on `PushSink` cancels the token but does not await join or call
+`ctx.term()`. Use `shutdown()` for clean exit; use `Drop` for panics.
 
 ## Invariants
 

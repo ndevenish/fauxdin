@@ -26,9 +26,6 @@ SIMPLON consumer, and:
   backpressure; durable recording is the capture's responsibility.
 - Multi-endpoint fan-out at the transport layer. One PUSH endpoint per
   sink; run multiple pipelines if needed.
-- Replacing `zmq` with `rzmq`. The detector's ZeroMQ protocol version is
-  not supported by `rzmq`; we stay on `zmq = "0.10"` and wrap blocking
-  socket I/O in worker threads.
 
 ## What v1 got wrong (one-line recap)
 

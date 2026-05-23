@@ -10,9 +10,8 @@ anyhow = "1.0.100"
 clap = { version = "4.5.50", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing = "0.1.41"
-#rzmq = "0.5.4"
+rzmq = { path = "./rzmq/core" }
 serde = { version = "1.0.228", features = ["derive"] }
-zmq = "0.10.0"
 tokio-util = "0.7.16"
 console-subscriber = "0.5.0"
 thread-id = "5.0.0"
@@ -20,3 +19,9 @@ url = "2.5.7"
 serde_json = "1.0.145"
 minio = "0.3.0"
 toml = "0.9.8"
+
+[dev-dependencies]
+# libzmq via the sync `zmq` crate is only used as a wire-interop peer in
+# `sink::tests::*` — it gives us cross-implementation verification that
+# rzmq's PUSH speaks ZMTP that libzmq's PULL accepts.
+zmq = "0.10.0"

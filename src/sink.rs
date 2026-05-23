@@ -10,15 +10,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
+use rzmq::socket::options as zmq_opts;
+use rzmq::socket::{MonitorReceiver, SocketEvent};
+use rzmq::{Context, Msg, Socket, SocketType};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 use url::Url;
 
 use crate::messages::{MultipartGroup, Seq};
 
 const DELIVERY_BROADCAST_CAPACITY: usize = 4096;
+const MONITOR_CAPACITY: usize = 256;
 
 // ============================================================================
 // Public configuration and reporting types
@@ -30,26 +34,20 @@ pub struct PushSinkConfig {
     /// currently buffered messages may be higher than this, if it was
     /// resized while above the new capacity.
     pub buffer_capacity: usize,
-    /// In addition to this buffer, the ZeroMQ socket itself will be set up
-    /// with a high water mark capacity of `zmq_send_hmw`, so the maximum
-    /// number of messages that can be buffered is `presocket_queue_length +
-    /// zmq_send_hwm + 1`, depending on whether the ZeroMQ socket is internally
-    /// buffering (it does not do this before being connected to, for
-    /// instance). Whereas normally in ZMQ a HWM of zero means "no limit", here
-    /// it will cause an error, because if you want an unlimited buffer then
-    /// this socket wrapper is unnecessary.
+    /// In addition to this buffer, the underlying PUSH socket is given a
+    /// send-side high water mark of `zmq_send_hwm`, so the maximum number of
+    /// messages that can be queued downstream of `try_send` is roughly
+    /// `buffer_capacity + zmq_send_hwm`, depending on whether the socket is
+    /// internally buffering (it does not do this before a peer is connected,
+    /// for instance). A value of zero or less is rejected — if you truly
+    /// want an unlimited buffer, this socket wrapper is unnecessary.
     pub zmq_send_hwm: i32,
-    /// Backoff between retries when libzmq returns `EAGAIN` on `send`.
-    ///
-    /// The worker sends with `zmq::DONTWAIT` so the blocking thread stays
-    /// reactive to cancel and peer-monitor events. When libzmq's own send
-    /// buffer is full (peer not reading), `send` returns `EAGAIN` instead
-    /// of blocking; the worker sleeps this interval before retrying, and
-    /// during the sleep also wakes on cancel or peer-disconnect. The sync
-    /// `zmq` crate exposes no `POLLOUT`-style "wake when writable" hook
-    /// that composes with tokio, so a timed retry is the pragmatic
-    /// alternative: low CPU, adds at most one interval of latency per
-    /// retry. Tune down (e.g. 5ms) in tests where retry latency matters.
+    /// Reserved for future use. The current implementation does not poll
+    /// or retry — the worker awaits `send_multipart` (which blocks until
+    /// the peer is connected and accepts the message) and races it only
+    /// against [`Self::cancel`]. The field is kept on the public config so
+    /// callers that have it set don't need to change, and so a future
+    /// timeout-based variant can wire it back in without an API break.
     pub send_retry_interval: Duration,
     /// Cancellation token. The sink clones this and stores it; cancelling it
     /// (from anywhere) drains the buffer and stops the worker, identically to
@@ -124,10 +122,10 @@ pub enum EnqueueOutcome {
 ///
 /// # What it does
 ///
-/// [`try_send`](Self::try_send) hands a [`MultipartGroup`] to a worker
-/// thread that owns the underlying PUSH socket and writes every frame
-/// out with the right `SNDMORE` flags. Groups are atomic: either every
-/// frame reaches the socket or the whole group is dropped — never a
+/// [`try_send`](Self::try_send) hands a [`MultipartGroup`] to an async
+/// worker task that owns the underlying rzmq PUSH socket and writes every
+/// frame out as one logical multipart message. Groups are atomic: either
+/// every frame reaches the socket or the whole group is dropped — never a
 /// half-sent group. Each accepted group eventually produces exactly one
 /// [`DeliveryReport`] on the [`delivery_reports`](Self::delivery_reports)
 /// broadcast channel, tagged with the caller's [`Seq`] so upstream can
@@ -137,21 +135,21 @@ pub enum EnqueueOutcome {
 ///
 /// Raw ZMQ PUSH has two properties that don't fit this pipeline:
 ///
-/// 1. **No pre-connection buffering.** libzmq's send-side HWM only
+/// 1. **No pre-connection buffering.** ZeroMQ's send-side HWM only
 ///    applies once a peer has connected; frames sent before that are
-///    dropped. The detector can start streaming at any time, so we need
-///    a startup pad that absorbs frames until a downstream consumer
-///    actually attaches.
+///    dropped (in libzmq) or block the sender (in rzmq). The detector can
+///    start streaming at any time, so we need a startup pad that absorbs
+///    frames until a downstream consumer actually attaches.
 /// 2. **HWM-full and no-peer look identical to the sender.** A blocked
-///    `send` (or `EAGAIN` under `DONTWAIT`) doesn't tell you *why* —
-///    full peer buffer or no peer at all. That distinction matters here:
-///    pre-peer overflow is a startup-pad problem, peer-connected overflow
-///    is real backpressure, and they should be reported differently and
-///    may drive different policies upstream.
+///    send doesn't tell you *why* — full peer buffer or no peer at all.
+///    That distinction matters here: pre-peer overflow is a startup-pad
+///    problem, peer-connected overflow is real backpressure, and they
+///    should be reported differently and may drive different policies
+///    upstream.
 ///
 /// `PushSink` wraps the socket with a semaphore-bounded buffer in front
-/// and a `zmq_socket_monitor` PAIR socket behind, so peer count is
-/// always known. Drops are classified as
+/// and consumes the socket's monitor stream so peer count is always
+/// known. Drops are classified as
 /// [`PrefetchOverflow`](DropReason::PrefetchOverflow) (no peer yet) or
 /// [`BackpressureFull`](DropReason::BackpressureFull) (peer connected,
 /// can't keep up), and [`state`](Self::state) exposes the
@@ -159,19 +157,22 @@ pub enum EnqueueOutcome {
 ///
 /// # Threading
 ///
-/// Two `spawn_blocking` threads back each sink: a worker that owns the
-/// PUSH socket and runs a current-thread tokio runtime, and a monitor
-/// that reads connect/disconnect events off the inproc PAIR. The sync
-/// `zmq` crate is required (see [`PushSinkConfig`] docs and the
-/// `zmq-crate-constraint` note); these threads exist so blocking libzmq
-/// calls don't tie up the outer tokio runtime.
+/// The sink is fully tokio-native — three async tasks back it:
+///
+/// 1. A worker (`tokio::spawn`) owning the rzmq PUSH socket; runs the
+///    send loop and updates `SinkState`.
+/// 2. A monitor forwarder (`tokio::spawn`) bridging the rzmq monitor
+///    channel (a `fibre` MPMC) into a tokio `mpsc` the worker selects on.
+/// 3. A capacity task (`tokio::spawn`) that reconciles `current_cap` /
+///    `debt` with the shared semaphore on `set_buffer_capacity`.
 ///
 /// # Shutdown
 ///
 /// Drop or [`shutdown`](Self::shutdown) cancels the worker. Any groups
 /// still in the buffer report
 /// [`Dropped(SinkShutdown)`](DropReason::SinkShutdown). `shutdown` awaits
-/// the worker threads; `Drop` just signals and lets them exit.
+/// every task and terminates the rzmq context; `Drop` just signals and
+/// lets the tasks exit.
 pub struct PushSink {
     cancel: CancellationToken,
     tx: mpsc::UnboundedSender<WorkItem>,
@@ -180,7 +181,7 @@ pub struct PushSink {
     state_rx: watch::Receiver<SinkState>,
     reports_tx: broadcast::Sender<DeliveryReport>,
     worker: Option<JoinHandle<()>>,
-    monitor: Option<JoinHandle<()>>,
+    monitor_forwarder: Option<JoinHandle<()>>,
     capacity: Option<JoinHandle<()>>,
     port: Option<u16>,
     /// Currently-effective buffer capacity. Driven by the capacity task in
@@ -194,30 +195,79 @@ pub struct PushSink {
     debt: Arc<AtomicUsize>,
     cap_tx: watch::Sender<usize>,
     shutting_down: Arc<AtomicBool>,
+    socket: Socket,
+    ctx: Context,
 }
 
 impl PushSink {
-    /// Bind a zmq PUSH socket, given buffering configuration
+    /// Bind an rzmq PUSH socket, given buffering configuration.
     ///
     /// Regardless of ZeroMQ HWM settings or whether the socket is being
-    /// actively drained by an external client, a minimum
-    /// `presocket_queue_length` items can be buffered inside the
-    /// [`PushSink`]. This quantity can be adjusted at run-time without
-    /// reopening the socket, upon which the number of queued messages can
-    /// exceed the buffer length.
+    /// actively drained by an external client, a minimum `buffer_capacity`
+    /// items can be buffered inside the [`PushSink`]. This quantity can be
+    /// adjusted at run-time without reopening the socket, upon which the
+    /// number of queued messages can exceed the buffer length.
     ///
-    /// In addition to this buffer, the ZeroMQ socket itself will be set up
-    /// with a high water mark capacity, so the maximum number of messages that
-    /// can be buffered is `presocket_queue_length + zmq_send_hwm + 1`,
-    /// depending on whether the ZeroMQ socket is internally buffering (it does
-    /// not do this before being connected to, for instance).
+    /// In addition to this buffer, the rzmq PUSH socket is configured with
+    /// a send-side high water mark `zmq_send_hwm`, so the maximum number of
+    /// messages that can be buffered downstream of `try_send` is roughly
+    /// `buffer_capacity + zmq_send_hwm`, depending on whether the socket
+    /// is internally buffering (it does not do this before a peer is
+    /// connected, for instance).
     ///
-    /// Returns once the socket is bound (so [`port`](Self::port) is valid),
-    /// and the worker threads have been started.
+    /// Returns once the socket is bound (so [`port`](Self::port) is valid)
+    /// and all backing tasks have been started.
     pub async fn bind(endpoint: &str, config: PushSinkConfig) -> Result<Self> {
         config.validate()?;
 
-        let ctx = zmq::Context::new();
+        let ctx = Context::new().map_err(|e| anyhow!("rzmq context creation failed: {e}"))?;
+        match Self::bind_inner(endpoint, config, ctx.clone()).await {
+            Ok(sink) => Ok(sink),
+            Err(e) => {
+                let _ = ctx.term().await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn bind_inner(endpoint: &str, config: PushSinkConfig, ctx: Context) -> Result<Self> {
+        let socket = ctx
+            .socket(SocketType::Push)
+            .map_err(|e| anyhow!("socket creation failed: {e}"))?;
+        socket
+            .set_option(zmq_opts::SNDHWM, config.zmq_send_hwm)
+            .await
+            .map_err(|e| anyhow!("set_sndhwm failed: {e}"))?;
+        // Note on SNDTIMEO: rzmq uses the same option for both "wait for
+        // peer / pipe slot" (the user-facing semantics) and the underlying
+        // TCP `write_all` timeout in `data_io.rs`. Setting it to zero would
+        // make TCP writes time out immediately on any peer that can't drain
+        // at line rate, which rzmq treats as a fatal session error and
+        // tears the connection down. Leaving it at the default (`None`) means
+        // the worker awaits `send_multipart` until the peer connects and
+        // accepts the bytes; the cancellation token is the only thing that
+        // unblocks it. Backpressure is observed at the door instead: the
+        // worker holds its permit while it's awaiting `send_multipart`, so
+        // a slow peer naturally fills the front buffer and surfaces
+        // `BackpressureFull` / `PrefetchOverflow` to `try_send`.
+        // LINGER=0: on shutdown, drop unsent frames instead of blocking the
+        // context teardown.
+        socket
+            .set_option(zmq_opts::LINGER, 0i32)
+            .await
+            .map_err(|e| anyhow!("set_linger failed: {e}"))?;
+
+        let rzmq_monitor = socket
+            .monitor(MONITOR_CAPACITY)
+            .await
+            .map_err(|e| anyhow!("monitor setup failed: {e}"))?;
+
+        socket
+            .bind(endpoint)
+            .await
+            .map_err(|e| anyhow!("bind to {endpoint} failed: {e}"))?;
+        let port = read_port(&socket).await;
+
         let cancel = config.cancel.clone();
         let permits = Arc::new(Semaphore::new(config.buffer_capacity));
         let peers = Arc::new(AtomicUsize::new(0));
@@ -227,67 +277,43 @@ impl PushSink {
         let (tx, outbox_rx) = mpsc::unbounded_channel::<WorkItem>();
         let (reports_tx, _) = broadcast::channel(DELIVERY_BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(SinkState::WaitingForPeer { buffered: 0 });
-        let (monitor_tx, monitor_rx) = mpsc::unbounded_channel::<MonitorMsg>();
-        let (launch_tx, launch_rx) = oneshot::channel::<Result<Option<u16>>>();
+        let (mon_tx, mon_rx) = mpsc::unbounded_channel::<SocketEvent>();
         let (cap_tx, cap_rx) = watch::channel(config.buffer_capacity);
 
-        let monitor_endpoint = format!("inproc://fauxdin-sink-monitor-{}", monitor_token());
+        let monitor_forwarder =
+            tokio::spawn(monitor_forwarder_main(rzmq_monitor, mon_tx, cancel.clone()));
 
-        let worker_handle = {
-            let ctx = ctx.clone();
-            let config = config.clone();
+        let worker = {
+            let socket = socket.clone();
             let cancel = cancel.clone();
             let permits = permits.clone();
             let peers = peers.clone();
             let reports = reports_tx.clone();
             let shutting_down = shutting_down.clone();
-            let monitor_endpoint = monitor_endpoint.clone();
-            let endpoint = endpoint.to_string();
             let current_cap = current_cap.clone();
             let debt = debt.clone();
-            tokio::task::spawn_blocking(move || {
-                worker_thread_main(
-                    endpoint,
+            let config = config.clone();
+            tokio::spawn(async move {
+                let worker = Worker {
                     config,
-                    ctx,
-                    outbox_rx,
-                    monitor_rx,
+                    socket,
                     cancel,
                     permits,
-                    peers,
                     reports,
                     state_tx,
-                    launch_tx,
-                    monitor_endpoint,
+                    monitor_rx: Some(mon_rx),
+                    outbox: outbox_rx,
+                    peers_atomic: peers,
                     shutting_down,
+                    peers: 0,
                     current_cap,
                     debt,
-                );
+                };
+                worker.run().await;
             })
         };
 
-        let port = match launch_rx.await {
-            Ok(Ok(port)) => port,
-            Ok(Err(e)) => {
-                // Worker is exiting on its own; just wait for it.
-                let _ = worker_handle.await;
-                return Err(e);
-            }
-            Err(_) => {
-                return Err(anyhow!("sink worker exited before reporting bind result"));
-            }
-        };
-
-        let monitor_handle = {
-            let ctx = ctx.clone();
-            let cancel = cancel.clone();
-            let monitor_endpoint = monitor_endpoint.clone();
-            tokio::task::spawn_blocking(move || {
-                monitor_thread_main(ctx, monitor_endpoint, monitor_tx, cancel);
-            })
-        };
-
-        let capacity_handle = {
+        let capacity = {
             let permits = permits.clone();
             let cancel = cancel.clone();
             let current_cap = current_cap.clone();
@@ -304,14 +330,16 @@ impl PushSink {
             peers,
             state_rx,
             reports_tx,
-            worker: Some(worker_handle),
-            monitor: Some(monitor_handle),
-            capacity: Some(capacity_handle),
+            worker: Some(worker),
+            monitor_forwarder: Some(monitor_forwarder),
+            capacity: Some(capacity),
             port,
             current_cap,
             debt,
             cap_tx,
             shutting_down,
+            socket,
+            ctx,
         })
     }
 
@@ -381,20 +409,22 @@ impl PushSink {
     }
 
     /// Initiate shutdown. Drains the buffer, emitting `Dropped(SinkShutdown)`
-    /// for each undelivered message. Resolves once both worker threads have
-    /// joined.
+    /// for each undelivered message. Resolves once every background task has
+    /// joined and the rzmq context has terminated.
     pub async fn shutdown(mut self) {
         self.shutting_down.store(true, Ordering::Release);
         self.cancel.cancel();
         if let Some(h) = self.worker.take() {
             let _ = h.await;
         }
-        if let Some(h) = self.monitor.take() {
+        if let Some(h) = self.monitor_forwarder.take() {
             let _ = h.await;
         }
         if let Some(h) = self.capacity.take() {
             let _ = h.await;
         }
+        let _ = self.socket.close().await;
+        let _ = self.ctx.term().await;
     }
 }
 
@@ -417,17 +447,13 @@ struct WorkItem {
     permit: OwnedSemaphorePermit,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MonitorMsg {
-    PeerConnected,
-    PeerDisconnected,
-}
-
-fn monitor_token() -> String {
-    use std::sync::atomic::AtomicU64;
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}", std::process::id(), n)
+async fn read_port(socket: &Socket) -> Option<u16> {
+    let bytes = socket.get_option(zmq_opts::LAST_ENDPOINT).await.ok()?;
+    let endpoint = String::from_utf8(bytes).ok()?;
+    if endpoint.is_empty() {
+        return None;
+    }
+    Url::parse(&endpoint).ok()?.port()
 }
 
 fn compute_state(peers: usize, buffered: usize) -> SinkState {
@@ -450,99 +476,44 @@ fn state_significantly_differs(a: &SinkState, b: &SinkState) -> bool {
     }
 }
 
-fn build_socket(
-    ctx: &zmq::Context,
-    endpoint: &str,
-    config: &PushSinkConfig,
-    monitor_endpoint: &str,
-) -> Result<zmq::Socket> {
-    let sock = ctx
-        .socket(zmq::SocketType::PUSH)
-        .map_err(|e| anyhow!("socket creation failed: {e}"))?;
-    sock.set_sndhwm(config.zmq_send_hwm)
-        .map_err(|e| anyhow!("set_sndhwm failed: {e}"))?;
-    let events = zmq::SocketEvent::ACCEPTED as i32 | zmq::SocketEvent::DISCONNECTED as i32;
-    sock.monitor(monitor_endpoint, events)
-        .map_err(|e| anyhow!("monitor setup failed: {e}"))?;
-    sock.bind(endpoint)
-        .map_err(|e| anyhow!("bind to {endpoint} failed: {e}"))?;
-    Ok(sock)
-}
-
-fn port_from_socket(sock: &zmq::Socket) -> Option<u16> {
-    let ep = sock.get_last_endpoint().ok()?.ok()?;
-    Url::parse(&ep).ok()?.port()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn worker_thread_main(
-    endpoint: String,
-    config: PushSinkConfig,
-    ctx: zmq::Context,
-    outbox: mpsc::UnboundedReceiver<WorkItem>,
-    monitor_rx: mpsc::UnboundedReceiver<MonitorMsg>,
+/// Bridge the rzmq monitor receiver (a `fibre` MPMC) into a tokio mpsc the
+/// worker can `select!` on directly. Exits when the monitor closes or on
+/// cancellation.
+async fn monitor_forwarder_main(
+    rzmq_monitor: MonitorReceiver,
+    tx: mpsc::UnboundedSender<SocketEvent>,
     cancel: CancellationToken,
-    permits: Arc<Semaphore>,
-    peers_atomic: Arc<AtomicUsize>,
-    reports: broadcast::Sender<DeliveryReport>,
-    state_tx: watch::Sender<SinkState>,
-    launch: oneshot::Sender<Result<Option<u16>>>,
-    monitor_endpoint: String,
-    shutting_down: Arc<AtomicBool>,
-    current_cap: Arc<AtomicUsize>,
-    debt: Arc<AtomicUsize>,
 ) {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = launch.send(Err(anyhow!("worker runtime build failed: {e}")));
-            return;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            res = rzmq_monitor.recv() => {
+                match res {
+                    Ok(ev) => {
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
-    };
-
-    let sock = match build_socket(&ctx, &endpoint, &config, &monitor_endpoint) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = launch.send(Err(e));
-            return;
-        }
-    };
-
-    let port = port_from_socket(&sock);
-    if launch.send(Ok(port)).is_err() {
-        debug!("sink bind result receiver dropped before worker startup");
-        return;
     }
-
-    let worker = Worker {
-        config,
-        sock,
-        cancel,
-        permits,
-        reports,
-        state_tx,
-        monitor_rx,
-        outbox,
-        peers_atomic,
-        shutting_down,
-        peers: 0,
-        current_cap,
-        debt,
-    };
-    rt.block_on(worker.run());
+    debug!("sink monitor forwarder exiting");
 }
 
 struct Worker {
     config: PushSinkConfig,
-    sock: zmq::Socket,
+    socket: Socket,
     cancel: CancellationToken,
     permits: Arc<Semaphore>,
     reports: broadcast::Sender<DeliveryReport>,
     state_tx: watch::Sender<SinkState>,
-    monitor_rx: mpsc::UnboundedReceiver<MonitorMsg>,
+    /// `None` once the monitor forwarder has exited. Allows the main select
+    /// loop to drop the monitor arm and avoid busy-looping on a closed
+    /// receiver.
+    monitor_rx: Option<mpsc::UnboundedReceiver<SocketEvent>>,
     outbox: mpsc::UnboundedReceiver<WorkItem>,
     peers_atomic: Arc<AtomicUsize>,
     shutting_down: Arc<AtomicBool>,
@@ -551,23 +522,56 @@ struct Worker {
     debt: Arc<AtomicUsize>,
 }
 
+enum WorkerAction {
+    Break,
+    Monitor(SocketEvent),
+    MonitorClosed,
+    Work(WorkItem),
+}
+
 impl Worker {
     async fn run(mut self) {
         loop {
-            tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => break,
-                ev = self.monitor_rx.recv() => {
-                    let Some(ev) = ev else { break };
+            let cancel = self.cancel.clone();
+            let action = match self.monitor_rx.as_mut() {
+                Some(mon_rx) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => WorkerAction::Break,
+                        ev = mon_rx.recv() => match ev {
+                            Some(e) => WorkerAction::Monitor(e),
+                            None => WorkerAction::MonitorClosed,
+                        },
+                        work = self.outbox.recv() => match work {
+                            Some(w) => WorkerAction::Work(w),
+                            None => WorkerAction::Break,
+                        },
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => WorkerAction::Break,
+                        work = self.outbox.recv() => match work {
+                            Some(w) => WorkerAction::Work(w),
+                            None => WorkerAction::Break,
+                        },
+                    }
+                }
+            };
+
+            match action {
+                WorkerAction::Break => break,
+                WorkerAction::MonitorClosed => self.monitor_rx = None,
+                WorkerAction::Monitor(ev) => {
                     self.handle_monitor(ev);
                     self.emit_state();
-                },
-                work = self.outbox.recv() => {
-                    let Some(WorkItem { seq, group, permit }) = work else { break };
+                }
+                WorkerAction::Work(WorkItem { seq, group, permit }) => {
                     let outcome = self.send_group(&group).await;
                     drop(permit);
                     let _ = self.reports.send(DeliveryReport { seq, outcome });
-                },
+                }
             }
         }
         // Drain outstanding work as SinkShutdown
@@ -583,10 +587,11 @@ impl Worker {
         debug!("sink worker exiting");
     }
 
-    fn handle_monitor(&mut self, ev: MonitorMsg) {
+    fn handle_monitor(&mut self, ev: SocketEvent) {
         match ev {
-            MonitorMsg::PeerConnected => self.peers += 1,
-            MonitorMsg::PeerDisconnected => self.peers = self.peers.saturating_sub(1),
+            SocketEvent::HandshakeSucceeded { .. } => self.peers += 1,
+            SocketEvent::Disconnected { .. } => self.peers = self.peers.saturating_sub(1),
+            _ => {}
         }
         self.peers_atomic.store(self.peers, Ordering::Release);
     }
@@ -617,123 +622,35 @@ impl Worker {
         if n == 0 {
             return DeliveryOutcome::SendError("empty MultipartGroup".to_string());
         }
-        for (i, frame) in group.frames.iter().enumerate() {
-            let last = i + 1 == n;
-            let flags = if last {
-                zmq::DONTWAIT
-            } else {
-                zmq::DONTWAIT | zmq::SNDMORE
-            };
-            loop {
-                match self.sock.send(&frame[..], flags) {
-                    Ok(()) => break,
-                    Err(zmq::Error::EAGAIN) => {
-                        if let Some(outcome) = self.wait_during_eagain().await {
-                            return outcome;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("sink send error on frame {i}/{n}: {e}");
-                        return DeliveryOutcome::SendError(format!("{e}"));
-                    }
-                }
-            }
-        }
-        trace!("sink delivered {} frames", n);
-        DeliveryOutcome::Delivered
-    }
+        let frames: Vec<Msg> = group
+            .frames
+            .iter()
+            .map(|b| Msg::from_bytes(b.clone()))
+            .collect();
 
-    /// Wait between EAGAIN retries. Returns Some(outcome) if the send should
-    /// be abandoned (cancel or peer loss); None to retry.
-    async fn wait_during_eagain(&mut self) -> Option<DeliveryOutcome> {
-        let retry_interval = self.config.send_retry_interval;
-        tokio::select! {
+        // With SNDTIMEO unset, `send_multipart` blocks until the peer is
+        // connected and has accepted every frame, or returns
+        // `HostUnreachable` if the chosen peer was lost mid-send. The send
+        // future is cancel-safe (single mailbox + oneshot), so racing it
+        // against the cancellation token is sound.
+        let cancel = self.cancel.clone();
+        let res = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => {
-                Some(DeliveryOutcome::Dropped(DropReason::SinkShutdown))
-            },
-            ev = self.monitor_rx.recv() => {
-                let Some(ev) = ev else {
-                    return Some(DeliveryOutcome::Dropped(DropReason::SinkShutdown));
-                };
-                self.handle_monitor(ev);
-                self.emit_state();
-                if self.peers == 0 {
-                    // Peer went away mid-send. Note: this also fires
-                    // legitimately right after startup if a DISCONNECTED
-                    // event arrives, but in that case we had a peer briefly.
-                    Some(DeliveryOutcome::Dropped(DropReason::BackpressureFull))
-                } else {
-                    None
-                }
-            },
-            _ = tokio::time::sleep(retry_interval) => None,
-        }
-    }
-}
-
-fn monitor_thread_main(
-    ctx: zmq::Context,
-    endpoint: String,
-    tx: mpsc::UnboundedSender<MonitorMsg>,
-    cancel: CancellationToken,
-) {
-    let pair = match ctx.socket(zmq::SocketType::PAIR) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("sink monitor failed to create PAIR: {e}");
-            return;
-        }
-    };
-    if let Err(e) = pair.set_rcvtimeo(100) {
-        error!("sink monitor failed to set rcvtimeo: {e}");
-        return;
-    }
-    if let Err(e) = pair.connect(&endpoint) {
-        error!("sink monitor failed to connect to {endpoint}: {e}");
-        return;
-    }
-
-    let accepted = zmq::SocketEvent::ACCEPTED as u16;
-    let disconnected = zmq::SocketEvent::DISCONNECTED as u16;
-
-    while !cancel.is_cancelled() {
-        let event_bytes = match pair.recv_bytes(0) {
-            Ok(b) => b,
-            Err(zmq::Error::EAGAIN) => continue,
-            Err(zmq::Error::ETERM) => break,
-            Err(e) => {
-                error!("sink monitor recv error: {e}");
-                break;
-            }
+            _ = cancel.cancelled() => return DeliveryOutcome::Dropped(DropReason::SinkShutdown),
+            res = self.socket.send_multipart(frames) => res,
         };
-        // Second frame is the endpoint string; we don't use it.
-        match pair.recv_bytes(0) {
-            Ok(_) => {}
+
+        match res {
+            Ok(()) => {
+                trace!("sink delivered {} frames", n);
+                DeliveryOutcome::Delivered
+            }
             Err(e) => {
-                warn!("sink monitor failed reading endpoint frame: {e}");
-                continue;
+                warn!("sink send error: {e}");
+                DeliveryOutcome::SendError(format!("{e}"))
             }
         }
-        if event_bytes.len() < 2 {
-            warn!("sink monitor received short event frame");
-            continue;
-        }
-        let event = u16::from_ne_bytes([event_bytes[0], event_bytes[1]]);
-        let msg = if event == accepted {
-            Some(MonitorMsg::PeerConnected)
-        } else if event == disconnected {
-            Some(MonitorMsg::PeerDisconnected)
-        } else {
-            None
-        };
-        if let Some(m) = msg
-            && tx.send(m).is_err()
-        {
-            break;
-        }
     }
-    debug!("sink monitor exiting");
 }
 
 /// Owns the live `current_cap` and `debt` atomics; reconciles them with the
@@ -859,6 +776,7 @@ mod tests {
         }
     }
 
+    /// libzmq PULL peer; exercises rzmq PUSH ↔ libzmq PULL wire interop.
     fn pull_peer(port: u16) -> (zmq::Context, zmq::Socket) {
         let ctx = zmq::Context::new();
         let sock = ctx.socket(zmq::SocketType::PULL).unwrap();
@@ -987,8 +905,14 @@ mod tests {
     }
 
     // ------- peer connection state -------
+    //
+    // Tests that share a tokio runtime with a libzmq peer must use the
+    // multi-thread flavor: the rzmq sink and its internal actors all run as
+    // tokio tasks, so blocking recv_* / recv_multipart calls on libzmq
+    // sockets would stall the whole runtime under the default
+    // current-thread test executor.
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_transitions_state_to_streaming() {
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
@@ -1016,7 +940,7 @@ mod tests {
         sink.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn peer_disconnect_returns_to_waiting_for_peer() {
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
@@ -1028,7 +952,7 @@ mod tests {
             Duration::from_secs(3),
         )
         .await;
-        // Drop the peer; ZMQ will fire DISCONNECTED on the monitor.
+        // Drop the peer; rzmq will fire Disconnected on the monitor.
         drop(peer);
         drop(ctx);
         wait_for(
@@ -1042,7 +966,7 @@ mod tests {
 
     // ------- multipart correctness -------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multipart_group_arrives_intact() {
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
@@ -1064,7 +988,7 @@ mod tests {
         sink.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_frame_group_arrives_intact() {
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         let port = sink.port().unwrap();
@@ -1085,7 +1009,7 @@ mod tests {
 
     // ------- backpressure -------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn true_backpressure_drops_with_backpressure_full() {
         let cfg = PushSinkConfig {
             buffer_capacity: 5,
@@ -1105,10 +1029,18 @@ mod tests {
         )
         .await;
 
-        // Flood — peer never recv()s, so ZMQ buffer + our buffer fill up.
+        // Flood with payloads large enough that the OS TCP send buffer can
+        // hold only a few before the kernel refuses more writes. Tiny
+        // payloads disappear into the (typically multi-MB) TCP buffer
+        // faster than `try_send` can produce them, so we'd never see the
+        // buffer saturate — bumping payload size is what forces the worker
+        // to stall on `ResourceLimitReached` long enough for our front
+        // buffer to fill.
+        let payload = vec![0u8; 64 * 1024];
+        let payload_slice: &[u8] = &payload;
         let mut got_bp_drop = false;
         for i in 0..200u64 {
-            match sink.try_send(i, group(&[b"x"])) {
+            match sink.try_send(i, group(&[payload_slice])) {
                 EnqueueOutcome::Enqueued => {}
                 EnqueueOutcome::Dropped(DropReason::BackpressureFull) => {
                     got_bp_drop = true;

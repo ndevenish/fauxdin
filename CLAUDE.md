@@ -46,9 +46,16 @@ accidentally violate:
 - **Mirror and capture are independent subscribers** with different drop
   policies (`DropNewest` for sink, `NeverDrop` for capture). Capture
   errors **never** mutate lifecycle state.
-- **`zmq = "0.10"` stays.** `rzmq` was ruled out — see the
-  `zmq-crate-constraint` memory and the constraints section of `sink.md`.
-  Wrap blocking ZMQ I/O in `spawn_blocking` worker threads.
+- **Async-native `rzmq` (vendored at `rzmq/`).** The connect side
+  negotiates a ZMTP/2.0 downgrade for legacy Eiger detectors; see
+  `rzmq/rzmq-v2-plan.md`. fauxdin pins the vendored copy via `path = "./rzmq/core"`
+  rather than the crates.io release. All ZMQ I/O is plain `tokio::spawn`
+  tasks — no `spawn_blocking` in the hot path. **Don't set `SNDTIMEO = 0`
+  on an rzmq socket**: it propagates to the session's TCP `write_all`
+  timeout (`sessionx/protocol_handler/data_io.rs`), so any peer that can't
+  drain at line rate becomes a fatal session error. Leave it at the
+  default and rely on the front buffer + the cancel token for backpressure
+  and shutdown.
 - **`Bytes` for frame storage.** `tokio_util::bytes::Bytes` — one copy at
   the PULL read, `Arc`-cloned everywhere after.
 
