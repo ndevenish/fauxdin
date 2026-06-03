@@ -55,7 +55,7 @@ pub enum StreamEvent {
     ///
     /// `undelivered_seqs` lists every group in the series whose sink
     /// delivery report was `Dropped` or `SendError` at the moment this
-    /// event was emitted. A late `Delivered` after this event is logged
+    /// event was emitted. A late `Sent` after this event is logged
     /// but does not retroactively amend the record.
     EndSeries {
         series: u64,
@@ -94,7 +94,7 @@ pub enum AbandonReason {
 /// see series-end summary."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStatus {
-    Delivered,
+    Sent,
     Dropped,
     Pending,
 }

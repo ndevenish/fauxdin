@@ -99,7 +99,7 @@ bumping. The only copy is the source's initial read from the zmq socket
 ### Sequence numbers thread the pipeline
 
 The source attaches a monotonic `seq: u64` to every group. The
-broadcaster preserves it. The sink reports `Delivered(seq)` /
+broadcaster preserves it. The sink reports `Sent(seq)` /
 `Dropped(seq, reason)` via the delivery channel. The lifecycle
 accumulates dropped seqs per active series and attaches them to
 `EndSeries` / `AbandonSeries` events. The capture records them.
@@ -230,7 +230,7 @@ the capture sees.
 The lifecycle attaches delivery information to each event:
 
 - `Frame` includes the per-frame `delivery: DeliveryStatus` (whether
-  every constituent `seq` was `Delivered`, `Dropped`, or `SendError`).
+  every constituent `seq` was `Sent`, `Dropped`, or `SendError`).
 - `EndSeries` and `AbandonSeries` include `undelivered_seqs: Vec<u64>`
   for the series.
 
@@ -238,7 +238,7 @@ The lifecycle keeps an in-flight set of `seq` per active series and
 drains it as `DeliveryReport`s arrive. On `EndSeries` /
 `AbandonSeries`, any seqs still in the set are reported as undelivered
 (they may yet land at the sink, but we don't wait — the capture closes
-the series with the best info we have, and a late `Delivered` is logged
+the series with the best info we have, and a late `Sent` is logged
 but cannot retroactively change the event).
 
 ### `capture` — swappable trait
@@ -320,7 +320,7 @@ pub enum AbandonReason {
 }
 
 pub enum DeliveryStatus {
-    Delivered,
+    Sent,
     Dropped,
     Pending,           // sink hasn't reported yet at event-emission time
 }

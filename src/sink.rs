@@ -73,7 +73,9 @@ impl PushSinkConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkState {
+    /// No clients are connected, and we have a buffer of pending messages
     WaitingForPeer { buffered: usize },
+    /// Clients are connected, and we have a buffer of pending messages
     Streaming { peers: usize, buffered: usize },
 }
 
@@ -85,7 +87,7 @@ pub struct DeliveryReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryOutcome {
-    Delivered,
+    Sent,
     Dropped(DropReason),
     SendError(String),
 }
@@ -593,8 +595,8 @@ impl Worker {
 
         match res {
             Ok(()) => {
-                trace!("sink delivered {} frames", n);
-                DeliveryOutcome::Delivered
+                trace!("sink sent {} frames", n);
+                DeliveryOutcome::Sent
             }
             Err(e) => {
                 warn!("sink send error: {e}");
@@ -1038,20 +1040,20 @@ mod tests {
             peer
         });
 
-        let mut delivered = HashSet::new();
-        while delivered.len() < n as usize {
+        let mut sent = HashSet::new();
+        while sent.len() < n as usize {
             let r = tokio::time::timeout(Duration::from_secs(5), reports.recv())
                 .await
                 .expect("timed out waiting for delivery report")
                 .expect("reports channel closed");
-            if r.outcome == DeliveryOutcome::Delivered {
-                delivered.insert(r.seq);
+            if r.outcome == DeliveryOutcome::Sent {
+                sent.insert(r.seq);
             } else {
                 panic!("unexpected outcome: {:?}", r);
             }
         }
         let _peer = drain_task.await.unwrap();
-        assert_eq!(delivered, (0u64..n).collect::<HashSet<_>>());
+        assert_eq!(sent, (0u64..n).collect::<HashSet<_>>());
         sink.shutdown().await;
     }
 

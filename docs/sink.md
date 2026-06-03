@@ -65,7 +65,7 @@ pub struct DeliveryReport {
 #[derive(Clone, Debug)]
 pub enum DeliveryOutcome {
     /// All frames of the group accepted by the PUSH socket.
-    Delivered,
+    Sent,
     /// Group never reached the socket. See DropReason.
     Dropped(DropReason),
     /// Send was attempted but the socket returned a non-EAGAIN error.
@@ -253,7 +253,7 @@ For each `(seq, group, permit)` pulled from the outbox:
 2. Call `socket.send_multipart(frames).await`, racing it against
    `cancel.cancelled()`. The send future is cancel-safe per rzmq's
    contract: dropping it does not corrupt the actor's state.
-3. `Ok(())`: emit `Delivered(seq)`, drop permit.
+3. `Ok(())`: emit `Sent(seq)`, drop permit.
 4. `Err(_)`: emit `SendError(e)`, drop permit. **Never panic.**
 5. Cancellation: emit `Dropped(SinkShutdown)`, drop permit.
 
