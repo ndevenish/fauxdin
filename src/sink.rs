@@ -829,9 +829,10 @@ mod tests {
         sink.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn door_drops_emit_no_delivery_report() {
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
+        let port = sink.port().unwrap();
         let mut reports = sink.delivery_reports();
         // Fill the buffer with no peer.
         for i in 0..10u64 {
@@ -843,12 +844,27 @@ mod tests {
             sink.try_send(dropped_seq, group(&[b"x"])),
             EnqueueOutcome::Dropped(DropReason::PrefetchOverflow),
         );
-        // Wait a moment for any reports to surface; collect what we get.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Now connect a peer and drain the buffer. The 10 buffered seqs each
+        // produce a report once delivered — that's the positive control that
+        // proves reports actually flow — while the door-dropped seq must stay
+        // absent.
+        let (_ctx, peer) = pull_peer(port);
+        for _ in 0..10 {
+            peer.recv_bytes(0).unwrap();
+        }
         let mut seen_seqs = HashSet::new();
-        while let Ok(r) = reports.try_recv() {
+        while seen_seqs.len() < 10 {
+            let r = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+                .await
+                .expect("timed out collecting delivery reports")
+                .expect("reports channel closed");
             seen_seqs.insert(r.seq);
         }
+        assert_eq!(
+            seen_seqs,
+            (0..10u64).collect::<HashSet<_>>(),
+            "every buffered seq must be delivered and reported"
+        );
         assert!(
             !seen_seqs.contains(&dropped_seq),
             "door-dropped seq must not produce a report; saw {seen_seqs:?}"
