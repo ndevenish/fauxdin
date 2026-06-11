@@ -1200,54 +1200,18 @@ mod tests {
 
     #[tokio::test]
     async fn try_send_after_shutdown_returns_shutting_down() {
-        // `shutdown` consumes self, so to exercise post-shutdown `try_send`
-        // we share the sink's internals with a `PushSinkForTest` stand-in
-        // that mirrors `try_send`'s logic, flip `shutting_down` by hand,
-        // and check the stand-in returns `ShuttingDown`.
+        // `shutdown` consumes self, so we drive the shutting-down state
+        // directly on the live sink — cancel its token and flip the flag the
+        // worker would set on exit — then call the *real* try_send and assert
+        // it short-circuits to ShuttingDown.
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
-        let fake = PushSinkForTest {
-            tx: sink.tx.clone(),
-            permits: sink.permits.clone(),
-            peers: sink.peers.clone(),
-            shutting_down: sink.shutting_down.clone(),
-        };
         sink.cancel.cancel();
         sink.shutting_down.store(true, Ordering::Release);
-        let r = fake.try_send(0, group(&[b"x"]));
-        assert_eq!(r, EnqueueOutcome::ShuttingDown);
+        assert_eq!(
+            sink.try_send(0, group(&[b"x"])),
+            EnqueueOutcome::ShuttingDown
+        );
         sink.shutdown().await;
-    }
-
-    /// Minimal mirror of PushSink::try_send for testing the shutting-down
-    /// path without needing to reconstruct a full PushSink.
-    struct PushSinkForTest {
-        tx: mpsc::UnboundedSender<WorkItem>,
-        permits: Arc<Semaphore>,
-        peers: Arc<AtomicUsize>,
-        shutting_down: Arc<AtomicBool>,
-    }
-    impl PushSinkForTest {
-        fn try_send(&self, seq: Seq, group: Arc<MultipartGroup>) -> EnqueueOutcome {
-            if self.shutting_down.load(Ordering::Acquire) {
-                return EnqueueOutcome::ShuttingDown;
-            }
-            let permit = match self.permits.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    let reason = if self.peers.load(Ordering::Acquire) > 0 {
-                        DropReason::BackpressureFull
-                    } else {
-                        DropReason::PrefetchOverflow
-                    };
-                    return EnqueueOutcome::Dropped(reason);
-                }
-            };
-            let work = WorkItem { seq, group, permit };
-            if self.tx.send(work).is_err() {
-                return EnqueueOutcome::ShuttingDown;
-            }
-            EnqueueOutcome::Enqueued
-        }
     }
 
     #[tokio::test]
