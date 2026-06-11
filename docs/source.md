@@ -175,13 +175,23 @@ made from observing the `SourceState` watch — not the source's.
 ### Drop policy
 
 The hand-off channel to the broadcaster is bounded (`channel_capacity`). On
-a full channel the recv task does **not** block — blocking the recv loop
-would stall the socket and let ZMQ's own RCVHWM silently drop upstream. It
-instead drops the just-read group at the door, increments a dropped counter,
-and logs a warning. This is the "drop loudly at the PULL boundary" failure
-mode from `plan.md` §broadcaster: if a `NeverDrop` capture subscriber
-back-pressures the broadcaster hard enough to fill the source channel, the
-source sheds load visibly rather than stalling the mirror.
+a full channel the recv task does **not** block — it drops the just-read
+group at the door, increments a dropped counter, and logs a warning. This is
+the "drop loudly at the PULL boundary" failure mode from `plan.md`
+§broadcaster: if a `NeverDrop` capture subscriber back-pressures the
+broadcaster hard enough to fill the source channel, the source sheds load
+visibly (seq gap + log) rather than stalling the mirror.
+
+Crucially, the recv loop must never block, because blocking it would back up
+into the PULL socket's RCVHWM queue and from there to the detector. ZMQ
+PUSH/PULL is a *backpressure* pattern, not a lossy one: rzmq's PULL incoming
+queue is a bounded channel sized to RCVHWM (`pull_socket.rs`,
+`fair_queue.rs`), and when it is full the session blocks pushing into it,
+propagating backpressure through TCP to the detector's PUSH socket. A
+detector mid-exposure cannot pause, so it drops frames *internally* where we
+cannot see or report them. Shedding must therefore happen at our channel
+(visible), never via socket backpressure (invisible). See the RCVHWM open
+question below.
 
 ## Invariants
 
@@ -253,11 +263,36 @@ Required coverage before this is considered done. Testable against a plain
    reset signal onto a side channel? Leaning toward the lifecycle observing
    the existing `SourceState` watch — no new channel, source stays
    series-ignorant. Pin this down in `lifecycle.md`.
-3. **RCVHWM vs. channel_capacity interaction.** ZMQ's own RCVHWM will drop
-   upstream before our channel ever sees the message if it's set too low.
-   It must be sized so the front buffer (our channel) is the binding
-   constraint, not RCVHWM. Document a recommended ratio or derive RCVHWM
-   from `channel_capacity`.
+3. **RCVHWM vs. channel_capacity interaction.** The two are bounded buffers
+   *in series* on the drain path: detector → PULL RCVHWM queue → recv task →
+   hand-off channel (`channel_capacity`) → broadcaster. Because the recv
+   loop unconditionally pulls from the socket and drops at the channel door,
+   it continuously empties the RCVHWM queue, so the **channel is the binding
+   constraint by construction** — it fills when the broadcaster (i.e. the
+   `NeverDrop` capture) stalls. RCVHWM is upstream of the shed point and
+   only fills if the *recv task itself* stalls; the two therefore guard
+   different stalls, not the same one.
+
+   PUSH/PULL is a backpressure pattern, **not lossy** (confirmed in rzmq:
+   PULL's incoming queue is a bounded channel sized to RCVHWM and blocks
+   when full). So a too-small RCVHWM is the dangerous direction: a brief
+   recv-task scheduling gap backs pressure up to the detector, which then
+   drops frames internally where we cannot observe them. RCVHWM is thus a
+   *jitter-absorption buffer, never a load-shedding knob*; all intentional
+   shedding happens at `channel_capacity`.
+
+   Sizing: RCVHWM counts frames (multipart HWM accounting is per-part and
+   libzmq-version-dependent), `channel_capacity` counts whole groups — so
+   they are not directly comparable; convert via frames-per-group. Treat
+   them as two independent knobs, not a derived ratio. Socket-buffer memory
+   is bounded by `RCVHWM × max_group_bytes`, and Eiger frames can be
+   multi-MB, so RCVHWM cannot simply be set huge. Proposed defaults:
+   `channel_capacity` in the tens-to-low-hundreds of groups (the deliberate
+   "capture hopelessly behind" threshold); `RCVHWM` a few hundred frames
+   (256–1024) as pure jitter headroom, with the memory implication called
+   out in config docs. State the invariant outright: *the recv loop never
+   blocks, so RCVHWM never propagates backpressure to the detector under
+   normal operation.*
 4. **Idle detection ownership confirmed elsewhere.** `AbandonSeries(Timeout)`
    is **not** here — the lifecycle owns the idle timer off its own
    `last_packet` (it has the series state; the source does not). Recorded
