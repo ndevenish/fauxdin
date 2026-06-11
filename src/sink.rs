@@ -1130,6 +1130,27 @@ mod tests {
         sink.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn empty_group_reports_send_error() {
+        // An empty MultipartGroup is admitted by try_send (which doesn't
+        // inspect frame count) but rejected by the worker's send_group before
+        // it touches the socket — so no peer is needed to drive this path.
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
+        let mut reports = sink.delivery_reports();
+        assert_eq!(sink.try_send(0, group(&[])), EnqueueOutcome::Enqueued);
+        let r = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+            .await
+            .expect("timed out waiting for delivery report")
+            .expect("reports channel closed");
+        assert_eq!(r.seq, 0);
+        assert!(
+            matches!(r.outcome, DeliveryOutcome::SendError(ref msg) if msg.contains("empty")),
+            "expected SendError for empty group, got {:?}",
+            r.outcome
+        );
+        sink.shutdown().await;
+    }
+
     // ------- shutdown -------
 
     #[tokio::test]
