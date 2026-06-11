@@ -872,6 +872,63 @@ mod tests {
         sink.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backpressure_drops_emit_no_delivery_report() {
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
+        let port = sink.port().unwrap();
+        let mut state = sink.state();
+        let mut reports = sink.delivery_reports();
+
+        // Connect a peer but never drain it (yet). Once it's streaming, peers > 0
+        // so a full-buffer drop is classified BackpressureFull, not
+        // PrefetchOverflow.
+        let (_ctx, peer) = pull_peer(port);
+        wait_for(
+            &mut state,
+            |s| matches!(s, SinkState::Streaming { .. }),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        // Push until the buffer backs up behind the stalled (non-draining) peer.
+        // The worker blocks in send_group once the ZMQ HWM fills, holding its
+        // permit, so permits are eventually exhausted and try_send rejects with
+        // BackpressureFull.
+        let mut enqueued = Vec::new();
+        let mut dropped_seq = None;
+        for seq in 0..100u64 {
+            match sink.try_send(seq, group(&[b"x"])) {
+                EnqueueOutcome::Enqueued => enqueued.push(seq),
+                EnqueueOutcome::Dropped(DropReason::BackpressureFull) => {
+                    dropped_seq = Some(seq);
+                    break;
+                }
+                other => panic!("unexpected outcome for seq {seq}: {other:?}"),
+            }
+        }
+        let dropped_seq = dropped_seq.expect("buffer never backed up to BackpressureFull");
+
+        // Drain the peer so the buffered seqs deliver and report — the positive
+        // control proving reports flow — while the dropped seq stays absent.
+        for _ in 0..enqueued.len() {
+            peer.recv_bytes(0).unwrap();
+        }
+        let want: HashSet<u64> = enqueued.iter().copied().collect();
+        let mut seen_seqs = HashSet::new();
+        while !want.is_subset(&seen_seqs) {
+            let r = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+                .await
+                .expect("timed out collecting delivery reports")
+                .expect("reports channel closed");
+            seen_seqs.insert(r.seq);
+        }
+        assert!(
+            !seen_seqs.contains(&dropped_seq),
+            "backpressure-dropped seq {dropped_seq} must not produce a report; saw {seen_seqs:?}"
+        );
+        sink.shutdown().await;
+    }
+
     // ------- peer connection state -------
     //
     // Tests that share a tokio runtime with a libzmq peer must use the
