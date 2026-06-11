@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_is_idempotent_via_drop() {
+    async fn drop_without_shutdown_terminates_cleanly() {
         let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
         // Drop without calling shutdown — Drop impl must cancel cleanly.
         drop(sink);
