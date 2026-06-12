@@ -36,14 +36,21 @@ Graceful zero-loss drain on shutdown. Multi-detector fan-out.
   spawns its recv+monitor tasks, `Broadcaster` its fan-out task, `PushSink`
   its worker+capacity tasks. The `pump` module adds exactly one task of its
   own — the forwarding adapter — plus the handles needed to join everything.
-- **Two stop signals, not one.** A root `CancellationToken` (`PumpConfig::cancel`)
-  is the *hard abort* — `cancel()` stops ingest, fan-out, forwarding, and
-  egress immediately. The source gets a **child** token (`root.child_token()`)
-  so it can be stopped *alone* without aborting the stages behind it; this is
-  the lever for graceful drain (see [Shutdown](#shutdown-graceful-by-default)).
-  The broadcaster and sink are given the root token (or children of it) and are
-  never cancelled on the graceful path — they drain via channel-close (EOF).
-  Cancelling root cascades to the source child and everything else.
+- **The graceful/hard distinction is a pump-wiring concern, not a component
+  one.** Every component still takes exactly one `cancel` token and knows
+  nothing about "graceful vs hard" — it just sees its token fire or its input
+  channel close. The pump creates a root `CancellationToken`
+  (`PumpConfig::cancel`, the *hard abort*) and exactly one child,
+  `source_token = root.child_token()`, for the source; the broadcaster and sink
+  take the root token directly. The asymmetry is entirely in what the pump does
+  at teardown: graceful = cancel `source_token` alone and call
+  `Broadcaster::join()` / `PushSink::drain(deadline)` (no-cancel paths), so the
+  stages behind the source drain via channel-close (EOF); hard = cancel `root`,
+  which cascades to the source child and aborts everything. Stopping the source
+  *is* the graceful trigger — its ordinary `shutdown()` is what the pump calls.
+  (The only place a second signal becomes a real token is *inside* `PushSink`,
+  where `drain` uses a private `drain` token separate from its abort `cancel`;
+  that is invisible to the rest of the pipeline — see `sink.md`.)
 - **`Arc`-clone only after the PULL read.** The one byte copy happens at the
   source's `recv_multipart` (`source.md` §Constraints). The group flows as
   `Arc<MultipartGroup>` through the broadcaster, through the adapter, into
