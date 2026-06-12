@@ -184,6 +184,26 @@ impl Broadcaster {
             let _ = h.await;
         }
     }
+
+    /// Await the fan-out task's *natural* completion **without** cancelling.
+    /// Used by graceful shutdown: once the source channel closes, the task
+    /// drains the remaining buffered groups, delivers each to every subscriber
+    /// (blocking on a `NeverDrop` subscriber's `send` if it is slow — this is
+    /// how the broadcaster waits for a lagging capture to accept the tail of
+    /// the stream), then exits and closes every subscriber `rx`. Differs from
+    /// [`shutdown`](Self::shutdown) only in that it never fires `cancel`, so
+    /// nothing is dropped that a subscriber would still accept. Pair it with a
+    /// caller-side deadline and fall back to `cancel` (or [`shutdown`]) on
+    /// timeout.
+    ///
+    /// If the root `cancel` token does fire from elsewhere while this is
+    /// awaiting, the fan-out task exits on its own cancel arm and this still
+    /// resolves — `join` simply never *initiates* cancellation itself.
+    pub async fn join(mut self) {
+        if let Some(h) = self.task.take() {
+            let _ = h.await;
+        }
+    }
 }
 
 impl Drop for Broadcaster {
@@ -770,6 +790,51 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), bc.shutdown())
             .await
             .expect("shutdown did not resolve after source close");
+    }
+
+    #[tokio::test]
+    async fn join_drains_to_completion_without_cancelling() {
+        // Graceful path: close the source, `join` (never cancels) must deliver
+        // every buffered group to a (concurrently drained) NeverDrop subscriber
+        // before resolving — nothing dropped that the subscriber would accept.
+        let (src_tx, src_rx) = mpsc::channel(4);
+        let mut b = BroadcasterBuilder::new();
+        let sub = b.subscribe("durable", 2, DropPolicy::NeverDrop);
+        let bc = b.spawn(src_rx, CancellationToken::new());
+
+        let mut rx = sub.rx;
+        let drain = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Some((seq, _)) = rx.recv().await {
+                got.push(seq);
+            }
+            got
+        });
+
+        let n = 30u64;
+        let producer = tokio::spawn(async move {
+            for i in 0..n {
+                src_tx.send((i, group(b"x"))).await.unwrap();
+            }
+            // Drop src_tx here → source closes, so `join` can complete.
+        });
+
+        producer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), bc.join())
+            .await
+            .expect("join did not resolve after source close");
+
+        // The fan-out task has exited → subscriber rx closes → drain finishes.
+        let got = tokio::time::timeout(Duration::from_secs(3), drain)
+            .await
+            .expect("drain did not finish")
+            .unwrap();
+        assert_eq!(
+            got,
+            (0..n).collect::<Vec<_>>(),
+            "join must deliver every buffered group in order, dropping none"
+        );
+        assert_eq!(*sub.dropped.borrow(), 0);
     }
 
     /// Await a `None` (closed) from a subscriber within a timeout.
