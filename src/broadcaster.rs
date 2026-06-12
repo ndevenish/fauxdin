@@ -333,20 +333,34 @@ mod tests {
             .expect("subscriber channel closed unexpectedly")
     }
 
-    /// Wait for a `watch::Receiver<u64>` to reach `target`, or panic.
+    /// Wait for a `watch::Receiver<u64>` to reach `target`, or panic. Panics
+    /// distinctly on timeout vs. the sender being dropped before `target` —
+    /// the latter would otherwise let a stalled fan-out pass silently.
     async fn wait_count(rx: &mut watch::Receiver<u64>, target: u64) {
-        let r = tokio::time::timeout(Duration::from_secs(3), async {
+        let reached = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if *rx.borrow() >= target {
-                    return;
+                    return true;
                 }
                 if rx.changed().await.is_err() {
-                    return;
+                    // Sender gone: no further updates can arrive. The last
+                    // value is whatever `borrow()` now reports.
+                    return *rx.borrow() >= target;
                 }
             }
         })
         .await;
-        assert!(r.is_ok(), "timed out waiting for count {target}");
+        match reached {
+            Ok(true) => {}
+            Ok(false) => panic!(
+                "watch sender dropped before reaching count {target}; last = {}",
+                *rx.borrow()
+            ),
+            Err(_) => panic!(
+                "timed out waiting for count {target}; last = {}",
+                *rx.borrow()
+            ),
+        }
     }
 
     // ------- validation -------
@@ -605,8 +619,14 @@ mod tests {
     async fn current_group_reaches_dropnewest_before_parking_on_neverdrop() {
         let (src_tx, src_rx) = mpsc::channel(8);
         let mut b = BroadcasterBuilder::new();
-        let fast = b.subscribe("fast", 8, DropPolicy::DropNewest);
+        // Register the NeverDrop subscriber FIRST. Phase ordering is by policy,
+        // not registration order, so a correct broadcaster still serves the
+        // DropNewest `fast` in phase 1 before parking on `slow` in phase 2. A
+        // naive single-pass-in-registration-order implementation would park on
+        // `slow` first and `fast` would never receive group 1 — this test
+        // fails for that implementation, which is the point.
         let slow = b.subscribe("slow", 1, DropPolicy::NeverDrop);
+        let fast = b.subscribe("fast", 8, DropPolicy::DropNewest);
         let cancel = CancellationToken::new();
         let bc = b.spawn(src_rx, cancel.clone());
         let mut rx_fast = fast.rx;
