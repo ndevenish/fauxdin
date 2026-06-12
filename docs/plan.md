@@ -48,8 +48,8 @@ Full account in [`../CLAUDE.md`](../CLAUDE.md).
 PULL socket
     │
     ▼
-┌─────────┐   (seq, Arc<MultipartGroup>)   ┌──────────────┐
-│ Source  │ ───────────────────────────▶  │ Broadcaster  │
+┌─────────┐   (seq, Arc<MultipartGroup>)    ┌──────────────┐
+│ Source  │ ───────────────────────────▶    │ Broadcaster  │
 └─────────┘                                 └──────────────┘
                                               │       │
                   ┌───────────────────────────┘       └────────────────────┐
