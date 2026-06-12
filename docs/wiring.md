@@ -153,10 +153,32 @@ struct Args {
     #[arg(long, default_value_t = 500)]  sink_buffer_capacity: usize,
     #[arg(long, default_value_t = 10_000)] recv_hwm: i32,
     #[arg(long, default_value_t = 50)]   send_hwm: i32,
+    /// Max time to flush the sink to the wire on a clean stop before forcing.
+    #[arg(long, default_value = "5s", value_parser = humantime)] drain_timeout: Duration,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> { /* init tracing, build, start, wait, shutdown */ }
+async fn main() -> anyhow::Result<()> {
+    // init tracing, parse args, build PumpConfig with root = CancellationToken::new()
+    let pump = Pump::start(cfg).await?;
+
+    // First Ctrl-C → soft stop. A second Ctrl-C → hard abort, which the
+    // in-progress `shutdown` observes (root cancel) and stops waiting on.
+    tokio::signal::ctrl_c().await?;
+    info!("interrupt: draining (press Ctrl-C again to force immediate shutdown)");
+    let forcer = {
+        let root = root.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                warn!("second interrupt: forcing immediate shutdown");
+                root.cancel();
+            }
+        })
+    };
+    pump.shutdown(args.drain_timeout).await; // returns early if the forcer cancels root
+    forcer.abort();
+    Ok(())
+}
 ```
 
 ## Internal architecture
@@ -255,8 +277,24 @@ this way when their input closes, draining what is buffered first:
 
 Steps 1–3 are bounded by fast operations (`try_send`, `Arc` clones); the only
 step that can genuinely block is the sink flush in step 4, which carries its
-own `deadline`. A second SIGINT (root `cancel`) collapses all of this to an
-immediate abort.
+own `deadline`.
+
+#### Signal policy
+
+The **binary** owns signals; `Pump` installs no handler (so it stays testable
+and a library embedding it keeps control of process signals). The policy:
+
+- **First Ctrl-C (SIGINT)** — soft stop: call `Pump::shutdown(drain_timeout)`,
+  the graceful drain above.
+- **Second Ctrl-C** — hard abort: cancel the root token. Because the
+  in-progress `shutdown` is awaiting at each step on tasks that watch the root
+  token (and `drain` races it), the cancel propagates immediately and
+  `shutdown` stops waiting — **regardless of how much `drain_timeout`
+  remained**. Still-buffered groups then report `Dropped(SinkShutdown)`.
+
+SIGTERM (service-manager stop) is treated like the first Ctrl-C: a soft stop.
+There is no "wait forever" state — either the drain finishes, the deadline
+fires, or a second interrupt forces it.
 
 This generalises to the capture build unchanged: the same EOF cascade drains
 the capture subscriber, and each terminal sink (`PushSink`, and later a
@@ -289,22 +327,22 @@ at startup.
 3. **One cancel, full teardown.** After root `cancel()` (or a second signal),
    every task exits and both rzmq contexts terminate; `shutdown` resolves and
    the process can exit. No reliance on `Drop` to make progress.
-7. **No needless drops on clean stop.** A graceful `shutdown` drops nothing the
-   downstream peer would have accepted within `drain_deadline`: every group
+4. **No needless drops on clean stop.** A graceful `shutdown` drops nothing the
+   downstream peer would have accepted within `drain_timeout`: every group
    already pulled from the PULL socket is delivered to the sink subscriber and
    flushed to the wire. Loss on a clean stop happens only past the deadline (a
    peer that won't drain), reported as `SinkShutdown`. Frames not yet pulled
    from the socket when ingest stops are abandoned — that is the boundary of
    "stop consuming", not a drop of in-flight work.
-4. **Order preserved, drops are the sink's.** The single subscriber receives
+5. **Order preserved, drops are the sink's.** The single subscriber receives
    groups in strictly increasing `Seq` order; the adapter offers each to the
    sink exactly once; the only expected losses are the sink's
    `BackpressureFull` / `PrefetchOverflow`. A broadcaster→sink `DropNewest`
    drop is a defect signal, not normal operation.
-5. **Mirror never blocks ingest.** With no `NeverDrop` subscriber, a stalled
+6. **Mirror never blocks ingest.** With no `NeverDrop` subscriber, a stalled
    downstream consumer cannot back-pressure the source into door-drops; it can
    only fill the sink buffer. The source keeps reading the wire throughout.
-6. **Exactly one subscriber.** The broadcaster is built with one `subscribe`
+7. **Exactly one subscriber.** The broadcaster is built with one `subscribe`
    call ("sink"); adding capture later is additive.
 
 ## Errors
@@ -367,8 +405,10 @@ clap's own; the logic under test lives in `pump`.
    [Shutdown](#shutdown-graceful-by-default)). Chosen now rather than deferred
    because it is the same EOF-cascade mechanism the capture build needs, and it
    keeps a clean operator stop from throwing away frames the peer would accept.
-   Open sub-question: a sensible default `drain_deadline` (a few seconds?) and
-   whether to expose it as a CLI flag.
+   Settled: default `drain_timeout` is **5s**, exposed as `--drain-timeout`.
+   First Ctrl-C / SIGTERM triggers the soft drain; a second Ctrl-C forces the
+   hard abort regardless of remaining timeout (see
+   [Shutdown §Signal policy](#signal-policy)).
 2. **Surfacing sink drops.** The adapter can count `Dropped(_)` outcomes into a
    `watch<u64>` for observability now, but the *authoritative* per-seq drop
    record is the sink's `DeliveryReport`, which nothing consumes until the
