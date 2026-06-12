@@ -634,7 +634,16 @@ mod tests {
         )
         .await;
         match s {
-            SourceState::Connected { endpoint: ep, .. } => assert_eq!(ep, endpoint),
+            SourceState::Connected {
+                endpoint: ep,
+                peer_addr,
+            } => {
+                assert_eq!(ep, endpoint);
+                // The monitor populates this from the transport `Connected`
+                // event preceding the handshake; a regression in that
+                // correlation surfaces as an empty addr.
+                assert!(!peer_addr.is_empty(), "peer_addr should be populated");
+            }
             _ => unreachable!(),
         }
         source.shutdown().await;
@@ -699,6 +708,30 @@ mod tests {
         source.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receives_after_endpoint_senders_dropped() {
+        let (_ctx, peer, endpoint) = push_peer();
+        // Drop the watch sender so the endpoint can never change again; this
+        // drives the recv task into its sender-closed `recv_only_loop` branch.
+        let (cfg, ep_tx) = config(&endpoint);
+        let (source, mut rx) = Source::connect(cfg).await.unwrap();
+        drop(ep_tx);
+        let mut state = source.state();
+        wait_for_state(
+            &mut state,
+            |s| matches!(s, SourceState::Connected { .. }),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        // Frames must still flow on the original endpoint via recv_only_loop.
+        peer.send("after-drop", 0).unwrap();
+        let (seq, group) = recv_group(&mut rx, Duration::from_secs(3)).await;
+        assert_eq!(seq, 0);
+        assert_eq!(&group.frames[0][..], b"after-drop");
+        source.shutdown().await;
+    }
+
     // ------- door drop on full channel -------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -760,12 +793,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn drop_without_shutdown_terminates_cleanly() {
+    async fn drop_without_shutdown_closes_handoff_channel() {
         let (_ctx, _peer, endpoint) = push_peer();
         let (cfg, _tx) = config(&endpoint);
-        let (source, _rx) = Source::connect(cfg).await.unwrap();
+        let (source, mut rx) = Source::connect(cfg).await.unwrap();
         drop(source);
-        // If Drop hangs or panics this test never returns; that is the
-        // assertion.
+        // Drop cancels the token; the recv task must observe that, exit, and
+        // drop its sender, which the receiver sees as a closed channel. If Drop
+        // stopped cancelling or the recv task ignored the token, this hangs to
+        // the timeout instead.
+        let closed = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("recv task did not exit after Drop");
+        assert!(closed.is_none(), "channel should be closed after Drop");
     }
 }
