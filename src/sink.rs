@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use rzmq::socket::options as zmq_opts;
@@ -166,6 +167,10 @@ pub enum EnqueueOutcome {
 /// lets the tasks exit.
 pub struct PushSink {
     cancel: CancellationToken,
+    /// Graceful-drain signal handed to the worker. Fired by [`drain`](Self::drain)
+    /// to flush the buffer to the wire before stopping, as opposed to `cancel`,
+    /// which aborts and reports the buffer as `SinkShutdown`.
+    drain: CancellationToken,
     tx: mpsc::UnboundedSender<WorkItem>,
     permits: Arc<Semaphore>,
     peers: Arc<AtomicUsize>,
@@ -259,6 +264,7 @@ impl PushSink {
         let port = read_port(&socket).await;
 
         let cancel = config.cancel.clone();
+        let drain = CancellationToken::new();
         let permits = Arc::new(Semaphore::new(config.buffer_capacity));
         let peers = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -272,6 +278,7 @@ impl PushSink {
         let worker = {
             let socket = socket.clone();
             let cancel = cancel.clone();
+            let drain = drain.clone();
             let permits = permits.clone();
             let peers = peers.clone();
             let reports = reports_tx.clone();
@@ -284,6 +291,7 @@ impl PushSink {
                     config,
                     socket,
                     cancel,
+                    drain,
                     permits,
                     reports,
                     state_tx,
@@ -311,6 +319,7 @@ impl PushSink {
 
         Ok(Self {
             cancel,
+            drain,
             tx,
             permits,
             peers,
@@ -408,6 +417,48 @@ impl PushSink {
         let _ = self.socket.close().await;
         let _ = self.ctx.term().await;
     }
+
+    /// Graceful drain. Stops accepting new groups and lets the worker flush
+    /// every already-buffered group **to the wire**, reporting real `Sent` /
+    /// `SendError` — not `Dropped(SinkShutdown)`. Bounded by `deadline`: if the
+    /// peer cannot accept the buffered groups within it, drain escalates
+    /// exactly like [`shutdown`](Self::shutdown) — the abort token fires, the
+    /// in-flight send is abandoned, and the remaining buffered groups emit
+    /// `Dropped(SinkShutdown)`. Resolves once every background task has joined,
+    /// the socket is closed, and the rzmq context has terminated.
+    pub async fn drain(mut self, deadline: Duration) {
+        // Refuse new sends, then tell the worker to flush-and-exit. The order
+        // matters: a sender that observes `shutting_down` will not enqueue, so
+        // the worker's flush sees a quiescent buffer.
+        self.shutting_down.store(true, Ordering::Release);
+        self.drain.cancel();
+
+        // Watchdog: if the flush isn't done by `deadline`, fire the abort token
+        // so the worker stops flushing and reports the remainder as
+        // SinkShutdown. We always await the worker join below, so the handle is
+        // never leaked regardless of which fires first.
+        let watchdog = {
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(deadline).await;
+                cancel.cancel();
+            })
+        };
+
+        if let Some(h) = self.worker.take() {
+            let _ = h.await;
+        }
+        watchdog.abort();
+
+        // The worker has exited; fire the abort token (if not already) so the
+        // capacity task — which only watches `cancel` — stops, then join it.
+        self.cancel.cancel();
+        if let Some(h) = self.capacity.take() {
+            let _ = h.await;
+        }
+        let _ = self.socket.close().await;
+        let _ = self.ctx.term().await;
+    }
 }
 
 impl Drop for PushSink {
@@ -462,6 +513,11 @@ struct Worker {
     config: PushSinkConfig,
     socket: Socket,
     cancel: CancellationToken,
+    /// Graceful-drain signal, distinct from the abort `cancel`. When fired,
+    /// the worker flushes every buffered group to the wire (reporting real
+    /// `Sent` / `SendError`) and then exits, rather than reporting buffered
+    /// groups as `SinkShutdown`. See [`PushSink::drain`].
+    drain: CancellationToken,
     permits: Arc<Semaphore>,
     reports: broadcast::Sender<DeliveryReport>,
     state_tx: watch::Sender<SinkState>,
@@ -479,6 +535,7 @@ struct Worker {
 
 enum WorkerAction {
     Break,
+    Drain,
     Monitor(SocketEvent),
     MonitorClosed,
     Work(WorkItem),
@@ -488,11 +545,16 @@ impl Worker {
     async fn run(mut self) {
         loop {
             let cancel = self.cancel.clone();
+            let drain = self.drain.clone();
+            // Priority: abort beats graceful drain beats normal work, so an
+            // abort during a drain still wins and a fired drain is handled
+            // before more groups are pulled.
             let action = match self.monitor_rx.as_ref() {
                 Some(mon_rx) => {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => WorkerAction::Break,
+                        _ = drain.cancelled() => WorkerAction::Drain,
                         ev = mon_rx.recv() => match ev {
                             Ok(e) => WorkerAction::Monitor(e),
                             Err(_) => WorkerAction::MonitorClosed,
@@ -507,6 +569,7 @@ impl Worker {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => WorkerAction::Break,
+                        _ = drain.cancelled() => WorkerAction::Drain,
                         work = self.outbox.recv() => match work {
                             Some(w) => WorkerAction::Work(w),
                             None => WorkerAction::Break,
@@ -517,6 +580,14 @@ impl Worker {
 
             match action {
                 WorkerAction::Break => break,
+                WorkerAction::Drain => {
+                    // Flush whatever is buffered to the wire, then exit. The
+                    // post-loop drain finds nothing (unless a deadline abort
+                    // cut the flush short, in which case the remainder reports
+                    // SinkShutdown like an ordinary abort).
+                    self.flush_remaining().await;
+                    break;
+                }
                 WorkerAction::MonitorClosed => self.monitor_rx = None,
                 WorkerAction::Monitor(ev) => {
                     self.handle_monitor(ev);
@@ -540,6 +611,29 @@ impl Worker {
         }
         self.shutting_down.store(true, Ordering::Release);
         debug!("sink worker exiting");
+    }
+
+    /// Flush every currently-buffered group to the wire, in order, reporting
+    /// real `Sent` / `SendError`. Stops early if the abort `cancel` fires (the
+    /// drain deadline elapsed) — `send_group` itself races `cancel`, so the
+    /// in-flight send returns `Dropped(SinkShutdown)` and the next iteration
+    /// bails, leaving the remainder for the post-loop SinkShutdown drain.
+    /// Returns once the outbox is empty (graceful) or `cancel` fired.
+    async fn flush_remaining(&mut self) {
+        loop {
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            match self.outbox.try_recv() {
+                Ok(WorkItem { seq, group, permit }) => {
+                    let outcome = self.send_group(&group).await;
+                    drop(permit);
+                    let _ = self.reports.send(DeliveryReport { seq, outcome });
+                }
+                Err(mpsc::error::TryRecvError::Empty)
+                | Err(mpsc::error::TryRecvError::Disconnected) => return,
+            }
+        }
     }
 
     fn handle_monitor(&mut self, ev: SocketEvent) {
@@ -1221,6 +1315,101 @@ mod tests {
         drop(sink);
         // If Drop hangs or panics this test never returns; that itself is
         // the assertion.
+    }
+
+    // ------- graceful drain -------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_drain_flushes_to_wire() {
+        // A draining peer is attached; drain() must push every buffered group
+        // to the wire and report Sent — never SinkShutdown.
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
+        let port = sink.port().unwrap();
+        let mut reports = sink.delivery_reports();
+        let (_ctx, peer) = pull_peer(port);
+        let mut state = sink.state();
+        wait_for(
+            &mut state,
+            |s| matches!(s, SinkState::Streaming { .. }),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        let n = 8u64;
+        for i in 0..n {
+            assert_eq!(sink.try_send(i, group(&[b"x"])), EnqueueOutcome::Enqueued);
+        }
+
+        // Peer drains concurrently so the flush can complete on the wire.
+        let drainer = tokio::task::spawn_blocking(move || {
+            peer.set_rcvtimeo(2000).unwrap();
+            for _ in 0..n {
+                peer.recv_bytes(0).unwrap();
+            }
+            peer
+        });
+
+        sink.drain(Duration::from_secs(3)).await;
+        let _peer = drainer.await.unwrap();
+
+        // Every group must have reported Sent; none SinkShutdown.
+        let mut sent = HashSet::new();
+        while let Ok(r) = reports.try_recv() {
+            match r.outcome {
+                DeliveryOutcome::Sent => {
+                    sent.insert(r.seq);
+                }
+                other => panic!(
+                    "graceful drain must flush, not drop: {other:?} for {}",
+                    r.seq
+                ),
+            }
+        }
+        assert_eq!(
+            sent,
+            (0..n).collect::<HashSet<_>>(),
+            "every buffered group must flush to the wire and report Sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_deadline_escalates() {
+        // No peer ever attaches, so the worker blocks on `send_multipart` and
+        // the buffer cannot flush. `drain` must give up at the deadline (not
+        // hang) and report every stuck group as SinkShutdown. Using no peer
+        // (rather than a stalled one) keeps this deterministic — nothing can
+        // disappear into a TCP/ZMQ buffer and report Sent.
+        let sink = PushSink::bind(TEST_ENDPOINT, test_config()).await.unwrap();
+        let mut reports = sink.delivery_reports();
+
+        let n = 8u64;
+        for i in 0..n {
+            assert_eq!(sink.try_send(i, group(&[b"x"])), EnqueueOutcome::Enqueued);
+        }
+
+        let start = Instant::now();
+        sink.drain(Duration::from_millis(300)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "drain must give up near the deadline, not hang (took {elapsed:?})"
+        );
+
+        // With no peer, nothing can flush — every group escalates to SinkShutdown.
+        let mut shutdown = HashSet::new();
+        while let Ok(r) = reports.try_recv() {
+            match r.outcome {
+                DeliveryOutcome::Dropped(DropReason::SinkShutdown) => {
+                    shutdown.insert(r.seq);
+                }
+                other => panic!("unexpected outcome on escalated drain: {other:?}"),
+            }
+        }
+        assert_eq!(
+            shutdown,
+            (0..n).collect::<HashSet<_>>(),
+            "every un-flushable group must report SinkShutdown after the deadline"
+        );
     }
 
     // ------- runtime resize -------
