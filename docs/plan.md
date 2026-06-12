@@ -163,8 +163,6 @@ it owns the socket.
 Drop policies:
 
 - `DropNewest` — the new group is rejected. Used by the sink.
-- `DropOldest` — pop the oldest queued group, push the new. Useful for
-  diagnostic taps; not used in the main pipeline.
 - `NeverDrop` — back-pressure-by-bounded-buffer; sender blocks the
   fan-out task. Used by the capture. Bounded by a generous capacity so
   a transient disk/S3 hiccup doesn't stall, but a permanent stall is
