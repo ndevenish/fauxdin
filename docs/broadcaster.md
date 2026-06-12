@@ -113,6 +113,17 @@ impl Broadcaster {
     /// exited (source channel closed or `cancel` fired). After this every
     /// subscriber `rx` observes a closed channel.
     pub async fn shutdown(self);
+
+    /// Await the fan-out task's *natural* completion **without** cancelling.
+    /// Used by graceful shutdown: once the source channel closes, the task
+    /// drains the remaining buffered groups, delivers each to every subscriber
+    /// (blocking on a `NeverDrop` subscriber's `send` if it is slow — this is
+    /// how the broadcaster waits for a lagging capture to accept the tail of
+    /// the stream), then exits and closes every subscriber `rx`. Differs from
+    /// [`shutdown`](Self::shutdown) only in that it never fires `cancel`, so
+    /// nothing is dropped that a subscriber would still accept. Pair it with a
+    /// caller-side deadline (the pump's) and fall back to `cancel` on timeout.
+    pub async fn join(self);
 }
 ```
 

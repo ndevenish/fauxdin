@@ -36,10 +36,14 @@ Graceful zero-loss drain on shutdown. Multi-detector fan-out.
   spawns its recv+monitor tasks, `Broadcaster` its fan-out task, `PushSink`
   its worker+capacity tasks. The `pump` module adds exactly one task of its
   own — the forwarding adapter — plus the handles needed to join everything.
-- **One token down the whole tree.** A single root `CancellationToken` is
-  cloned into every component's config (`SourceConfig::cancel`,
-  `BroadcasterBuilder::spawn(.., cancel)`, `PushSinkConfig::cancel`) and into
-  the adapter. One `cancel()` stops ingest, fan-out, forwarding, and egress.
+- **Two stop signals, not one.** A root `CancellationToken` (`PumpConfig::cancel`)
+  is the *hard abort* — `cancel()` stops ingest, fan-out, forwarding, and
+  egress immediately. The source gets a **child** token (`root.child_token()`)
+  so it can be stopped *alone* without aborting the stages behind it; this is
+  the lever for graceful drain (see [Shutdown](#shutdown-graceful-by-default)).
+  The broadcaster and sink are given the root token (or children of it) and are
+  never cancelled on the graceful path — they drain via channel-close (EOF).
+  Cancelling root cascades to the source child and everything else.
 - **`Arc`-clone only after the PULL read.** The one byte copy happens at the
   source's `recv_multipart` (`source.md` §Constraints). The group flows as
   `Arc<MultipartGroup>` through the broadcaster, through the adapter, into
@@ -114,10 +118,15 @@ impl Pump {
     /// far. (= `Broadcaster::forwarded`.)
     pub fn forwarded(&self) -> watch::Receiver<u64>;
 
-    /// Cancel the pipeline and await every task and both rzmq contexts.
-    /// Resolves once the process holds no live ZMQ resources. Idempotent with
-    /// the signal path: whoever fires `cancel` first wins; this awaits.
-    pub async fn shutdown(self);
+    /// Graceful shutdown. Stops pulling from the PULL socket, lets every group
+    /// already in the pipeline drain through to the wire, then tears down and
+    /// terminates both rzmq contexts. Bounded by `drain_deadline`: if the
+    /// downstream peer cannot accept the buffered groups within it, the
+    /// remainder is dropped (reported `SinkShutdown` by the sink) and teardown
+    /// proceeds. Cancelling the root token (`PumpConfig::cancel`) at any point
+    /// — e.g. a second SIGINT — escalates to immediate abort, which this
+    /// observes and stops waiting. See [Shutdown](#shutdown-graceful-by-default).
+    pub async fn shutdown(self, drain_deadline: Duration);
 }
 ```
 
@@ -203,24 +212,55 @@ consumer surfaces *only* as the sink filling its own buffer and reporting
 locally, and the source keeps draining the wire. This is the intended lossy
 mirror (`plan.md` §Non-goals).
 
-### Shutdown ordering
+### Shutdown (graceful by default)
 
-`cancel()` reaches every component at once. `shutdown` then *awaits* in
-dependency order so resources release cleanly and no task is joined while
-still feeding a downstream one:
+The mirror is lossy under *backpressure*, but a clean operator-initiated stop
+should not throw away frames the downstream peer would happily accept. So
+`Pump::shutdown` does not fire the root token; it **stops the front and lets
+the pipeline drain**, escalating to the hard token only if a deadline is
+exceeded. The whole point is to stop *consuming from the PULL socket* while
+flushing everything already pulled.
 
-1. `Source::shutdown` — stops ingest, joins recv+monitor, closes the PULL
-   socket, terminates its rzmq context. `source_rx` then closes.
-2. `Broadcaster::shutdown` — joins the fan-out task; the sink subscriber's
-   `rx` then closes.
-3. Forwarding-adapter task join — it has already observed `cancel` (or the
-   closed `rx`) and exited.
-4. `PushSink::shutdown` — drains its buffer emitting `Dropped(SinkShutdown)`
-   (unobserved here), joins worker+capacity, terminates its rzmq context.
+The mechanism is channel-close (EOF) propagation — the components already exit
+this way when their input closes, draining what is buffered first:
 
-Cancellation is **immediate teardown**, not a graceful flush: groups buffered
-in the sink at shutdown are dropped, not forced out. Zero-loss drain is a
-non-goal (below).
+1. **Stop ingest.** `Source::shutdown` cancels the source's child token: the
+   recv loop stops calling `recv_multipart` (no more frames pulled — frames
+   still sitting unread in the socket/OS buffer are abandoned, which is the
+   intended "stop consuming"), joins recv+monitor, closes the PULL socket,
+   terminates the source's rzmq context. Its `tx` drops, so `source_rx` closes.
+2. **Drain the broadcaster.** `Broadcaster::join` awaits the fan-out task's
+   *natural* completion (no cancel): it drains the remaining buffered groups
+   from `source_rx`, delivers each to every subscriber, then exits on EOF,
+   closing every subscriber `rx`. (When a `NeverDrop` capture subscriber later
+   exists, this step is exactly where the broadcaster *waits* for a slow
+   capture to accept the tail of the stream — no special-casing.)
+3. **Drain the adapter.** The forwarding-adapter task drains its now-closing
+   subscriber `rx`, `try_send`-ing each remaining group into the sink buffer,
+   then exits on EOF. Awaiting this handle proves the broadcaster delivered
+   everything to the sink subscriber.
+4. **Flush the sink.** `PushSink::drain(deadline)` lets the worker push every
+   buffered group to the wire, reporting real `Sent` / `SendError` — **not**
+   `SinkShutdown` — then stops and terminates the sink's rzmq context. If the
+   peer cannot drain within `deadline`, drain escalates: the root token is
+   cancelled, the worker aborts its current send, and the still-buffered
+   groups report `Dropped(SinkShutdown)`.
+
+Steps 1–3 are bounded by fast operations (`try_send`, `Arc` clones); the only
+step that can genuinely block is the sink flush in step 4, which carries its
+own `deadline`. A second SIGINT (root `cancel`) collapses all of this to an
+immediate abort.
+
+This generalises to the capture build unchanged: the same EOF cascade drains
+the capture subscriber, and each terminal sink (`PushSink`, and later a
+capture backend) gets its own bounded `drain`/`flush` before teardown.
+
+**Required component support** (specced alongside this doc):
+`PushSink::drain(deadline)` — flush-to-wire-then-stop, distinct from the
+abort-semantics `shutdown()`/`Drop` (see `sink.md`); and `Broadcaster::join()`
+— await natural completion without cancelling (see `broadcaster.md`). The
+source needs no addition — its existing `shutdown()` *is* the stop-ingest
+action.
 
 ### Control surface (minimal)
 
@@ -239,9 +279,16 @@ at startup.
    the wire. (Asserted indirectly: an end-to-end byte-for-byte round trip.)
 2. **Single runtime.** No `spawn_blocking` in the data path; one
    `#[tokio::main]`. (Structural — reviewed, not unit-tested.)
-3. **One cancel, full teardown.** After `cancel()` (or a signal), every task
-   exits and both rzmq contexts terminate; `shutdown` resolves and the process
-   can exit. No reliance on `Drop` to make progress.
+3. **One cancel, full teardown.** After root `cancel()` (or a second signal),
+   every task exits and both rzmq contexts terminate; `shutdown` resolves and
+   the process can exit. No reliance on `Drop` to make progress.
+7. **No needless drops on clean stop.** A graceful `shutdown` drops nothing the
+   downstream peer would have accepted within `drain_deadline`: every group
+   already pulled from the PULL socket is delivered to the sink subscriber and
+   flushed to the wire. Loss on a clean stop happens only past the deadline (a
+   peer that won't drain), reported as `SinkShutdown`. Frames not yet pulled
+   from the socket when ingest stops are abandoned — that is the boundary of
+   "stop consuming", not a drop of in-flight work.
 4. **Order preserved, drops are the sink's.** The single subscriber receives
    groups in strictly increasing `Seq` order; the adapter offers each to the
    sink exactly once; the only expected losses are the sink's
@@ -287,9 +334,18 @@ to a libzmq PUSH peer, exactly as the sink/source tests already do.
   `sink_state` staying `Streaming` while `forwarded` keeps climbing past the
   sink buffer depth) and the source keeps draining (no wedge); `cancel`
   still tears down promptly.
+- **Graceful drain (the shutdown headline test):** drained consumer attached,
+  push N groups through, then `Pump::shutdown(deadline)` *without* cancelling
+  root → the consumer receives **all N** intact (nothing thrown away on a clean
+  stop), and `shutdown` resolves. Variant: stop ingest with groups still
+  buffered in the sink and assert they flush to the wire rather than reporting
+  `SinkShutdown`.
+- **Drain deadline escalation:** stalled (non-draining) consumer, buffered
+  groups, `shutdown(short_deadline)` → resolves within ~`deadline` (does not
+  hang on the dead peer); the undrained groups are dropped, not flushed.
 - **Clean shutdown:** `Pump::start` then `shutdown` resolves within a bound;
   dropping the `Pump` without `shutdown` also terminates cleanly; firing the
-  shared `cancel` externally then `shutdown` resolves.
+  root `cancel` externally then `shutdown` resolves promptly (hard-abort path).
 - **Start errors:** bad `out_endpoint` (unbindable) and bad `in_endpoint`
   both return `Err` from `start` with no leaked tasks.
 
@@ -298,11 +354,14 @@ clap's own; the logic under test lives in `pump`.
 
 ## Open questions
 
-1. **Graceful drain on shutdown.** Today shutdown is immediate and buffered
-   groups are dropped. A "stop ingest, let the sink buffer flush with a
-   deadline, then stop" mode would lose fewer frames on a clean operator-
-   initiated stop. Deferred until there's a consumer who cares; the mirror is
-   lossy by contract anyway.
+1. **~~Graceful drain on shutdown.~~** *Resolved — built in.* `shutdown`
+   stops ingest and drains the pipeline to the wire with a bounded
+   `drain_deadline`, escalating to the hard token on timeout (see
+   [Shutdown](#shutdown-graceful-by-default)). Chosen now rather than deferred
+   because it is the same EOF-cascade mechanism the capture build needs, and it
+   keeps a clean operator stop from throwing away frames the peer would accept.
+   Open sub-question: a sensible default `drain_deadline` (a few seconds?) and
+   whether to expose it as a CLI flag.
 2. **Surfacing sink drops.** The adapter can count `Dropped(_)` outcomes into a
    `watch<u64>` for observability now, but the *authoritative* per-seq drop
    record is the sink's `DeliveryReport`, which nothing consumes until the
@@ -318,10 +377,16 @@ clap's own; the logic under test lives in `pump`.
   one subscriber; `StreamEvent` / `DeliveryReport` are not consumed. Adding
   capture is a later, additive step (one `subscribe(NeverDrop)` + a lifecycle
   task + a capture backend).
-- **No delivery guarantee.** Frames are dropped under backpressure by design
-  (`plan.md` §Non-goals). Durability is the capture's job, which isn't here.
+- **No delivery guarantee under backpressure.** Frames are dropped when the
+  peer can't keep up *while running* (`plan.md` §Non-goals). Durability is the
+  capture's job, which isn't here. Note this is distinct from *shutdown*, which
+  is graceful and drains (above) — the no-guarantee applies to steady-state
+  backpressure, not to a clean stop.
 - **No EPICS / runtime control.** CLI binds config once. The endpoint watch is
   the only runtime-shaped knob, and even it is set once.
-- **No graceful zero-loss shutdown** (see Open questions §1).
+- **No unbounded drain wait.** Graceful shutdown flushes to the wire only
+  within `drain_deadline`; it will not block forever on a dead peer. A dead
+  peer past the deadline loses its still-buffered tail (reported
+  `SinkShutdown`).
 - **Not multi-detector / multi-endpoint.** One PULL in, one PUSH out; run
   multiple processes for multiple detectors (`plan.md` §Non-goals).

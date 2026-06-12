@@ -8,7 +8,7 @@ bounded in-process buffer.
 
 **In:** ZMQ PUSH transport, peer-count-aware buffering, true-backpressure
 detection, per-message delivery reporting, atomic multipart preservation,
-clean shutdown.
+clean shutdown (immediate `shutdown` and bounded graceful `drain`).
 
 **Out (deferred to a later revision):** multi-endpoint fan-out, transport
 other than ZMQ PUSH, EPICS PV control surface (the state watcher and config
@@ -136,6 +136,21 @@ impl PushSink {
     /// future resolves once the worker thread has joined and the socket is
     /// closed.
     pub async fn shutdown(self);
+
+    /// Graceful drain. Stops accepting new groups (subsequent `try_send`
+    /// returns `ShuttingDown`) and lets the worker flush every already-buffered
+    /// group **to the wire**, reporting real `Sent` / `SendError` — not
+    /// `Dropped(SinkShutdown)`. Bounded by `deadline`: if the peer cannot
+    /// accept the buffered groups within it, drain escalates exactly like
+    /// `shutdown()` — the worker's cancel token fires, the in-flight send is
+    /// abandoned, and the remaining buffered groups emit
+    /// `Dropped(SinkShutdown)`. Resolves once the worker and capacity tasks
+    /// have joined, the socket is closed, and the rzmq context is terminated.
+    ///
+    /// Use `drain` for a clean operator stop where frames the peer would accept
+    /// should not be thrown away; use `shutdown` (immediate) for ordinary
+    /// teardown and `Drop` for panics.
+    pub async fn drain(self, deadline: Duration);
 }
 ```
 
@@ -280,6 +295,32 @@ slow peer into a fatal session error and tears the connection down.
 `Drop` on `PushSink` cancels the token but does not await join or call
 `ctx.term()`. Use `shutdown()` for clean exit; use `Drop` for panics.
 
+### Graceful drain
+
+`drain(deadline)` differs from `shutdown()` only in that the buffered groups
+are **flushed to the wire** instead of being dropped:
+
+1. Set `shutting_down` so further `try_send` is refused (`ShuttingDown`).
+2. Signal the worker to enter *flush mode* — a dedicated `drain`
+   `CancellationToken`, distinct from the abort `cancel`. In flush mode the
+   worker stops selecting the monitor/outbox arms and instead pulls each
+   buffered item with `try_recv` and sends it with the normal send loop
+   (which still races only the **abort** `cancel`, not `drain`), reporting
+   `Sent` / `SendError`. When `try_recv` reports empty, the buffer is flushed
+   and the worker exits.
+3. The whole flush is raced against `deadline`. On timeout, fire the abort
+   `cancel`: the worker's in-flight `send_multipart` is abandoned and any
+   groups not yet flushed emit `Dropped(SinkShutdown)`, identical to
+   `shutdown()`.
+4. Join the worker and capacity tasks, close the socket, `Context::term()`.
+
+Because the pump only calls `drain` *after* its forwarding adapter has stopped
+(no concurrent `try_send`), flush mode sees a quiescent buffer and the
+shutting-down/try_recv race is moot in that wiring. A late `try_send` racing
+the `shutting_down` store behaves exactly as the existing `shutdown` race does
+(it may be refused or land just before flush) — acceptable, and no worse than
+today.
+
 ## Invariants
 
 1. **No panic on send error.** Any libzmq error other than `EAGAIN`
@@ -330,6 +371,12 @@ Required test coverage before this is considered done:
   `WaitingForPeer`, in-flight group is reported (TBD outcome).
 - **Shutdown drains:** push N groups, immediately `shutdown()` → all N
   unsent groups emit `Dropped(SinkShutdown)`, threads join.
+- **Graceful drain flushes to the wire:** push N groups with a drained peer
+  attached, `drain(deadline)` → the peer receives all N and they report
+  `Sent` (not `SinkShutdown`); threads join.
+- **Graceful drain deadline escalates:** push N groups behind a stalled
+  (non-draining) peer, `drain(short_deadline)` → resolves within ~`deadline`,
+  the unflushed groups report `Dropped(SinkShutdown)`, no hang.
 - **Concurrent senders:** N tasks each call `try_send` → permit count
   never exceeds `buffer_capacity`, no double-emit, no lost report.
 - **Runtime resize — validation:** `set_buffer_capacity(0)` → `Err`,
